@@ -37,6 +37,7 @@ class ReceiptWindow:
         self.root, self.cfg, self.controller = root, cfg, controller
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="receipt")
         self.future = None
+        self._after_id = None
         self.gate = KeyGate()
         self.get_key_state = ctypes.windll.user32.GetAsyncKeyState
         self.get_key_state.argtypes = (ctypes.c_int,)
@@ -108,7 +109,8 @@ class ReceiptWindow:
 
     def accept(self, with_photo):
         if self.controller.snapshot().state not in {"error", "interrupted"}:
-            self._start(lambda: self.controller.accept(with_photo))
+            controller = self.controller
+            self._start(lambda: controller.accept(with_photo))
 
     def retry(self):
         if not self.controller.snapshot().can_retry:
@@ -161,6 +163,7 @@ class ReceiptWindow:
                 photo.close()
 
     def _poll(self):
+        self._after_id = None
         for key in (self.cfg.photo_key, self.cfg.no_photo_key):
             if not (self.get_key_state(0x70 + int(key[1:]) - 1) & 0x8000):
                 self.gate.release(key)
@@ -192,13 +195,20 @@ class ReceiptWindow:
         elif (busy or not view.has_image) and self.preview_ref is not None and not self.is_sample:
             self._clear_preview()
         self.last_view = view
-        self.root.after(50, self._poll)
+        self._after_id = self.root.after(50, self._poll)
+
+    def _cancel_poll(self):
+        if self._after_id is not None:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
 
     def close(self):
         if self.future is not None or self.controller.snapshot().busy:
             messagebox.showinfo("処理中です", "処理終了後に閉じてください。強制終了後は送信結果が不明になる場合があります。", parent=self.root)
             return
-        self.controller.discard()
+        if not self.controller.shutdown():
+            return
+        self._cancel_poll()
         self._clear_preview()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()

@@ -1,10 +1,11 @@
 import sys
+import gc
 import importlib.util
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from receipt_app.config import AppConfig
 from receipt_app.controller import Controller
@@ -29,9 +30,12 @@ class GuiTests(unittest.TestCase):
         self.window = ReceiptWindow(self.root, self.cfg, self.controller)
 
     def tearDown(self):
+        self.window._cancel_poll()
         self.window.executor.shutdown(wait=True)
         self.controller.discard()
         self.root.destroy()
+        self.window = None
+        gc.collect()
         self.temp.cleanup()
 
     def settle(self):
@@ -76,6 +80,18 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(gate.press("F2"))
         gate.release("F1")
         self.assertTrue(gate.press("F1"))
+
+    def test_closing_window_does_not_discard_a_failed_receipt(self):
+        from receipt_app.printer import PrintFailure
+        self.controller.printer = Mock()
+        self.controller.printer.print_image.side_effect = PrintFailure("transfer interrupted", uncertain=True)
+        self.window.accept(False)
+        self.settle()
+        with patch.object(self.root, "destroy"):
+            self.window.close()
+        self.assertEqual(self.storage.get(1).status, "error")
+        self.assertTrue(self.storage.get(1).outcome_uncertain)
+        self.assertFalse(self.controller.snapshot().has_image)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows file lock")

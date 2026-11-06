@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -69,6 +71,35 @@ class StorageTests(unittest.TestCase):
         self.assertIsNone(self.store.get(99))
         with self.assertRaisesRegex(ValueError, "受付番号 99"):
             self.store.update(99, "completed")
+
+    def test_uncertainty_is_sticky_across_retries_and_reopen(self):
+        ticket = self.store.allocate(False, "now")
+        self.store.update(ticket.number, "error", "transfer interrupted", outcome_uncertain=True)
+        self.store.update(ticket.number, "error", "connection refused", outcome_uncertain=False)
+        self.assertTrue(Storage(self.path).get(ticket.number).outcome_uncertain)
+        self.store.update(ticket.number, "completed")
+        self.assertTrue(self.store.get(ticket.number).outcome_uncertain)
+        self.assertFalse(self.store.allocate(False, "next").outcome_uncertain)
+
+    def test_migrates_legacy_database_without_resetting_sequence(self):
+        legacy_path = self.path.parent / "legacy.sqlite3"
+        with closing(sqlite3.connect(legacy_path)) as db, db:
+            db.execute("""CREATE TABLE receipts (
+                number INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+                with_photo INTEGER NOT NULL, status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '')""")
+            db.execute("INSERT INTO receipts VALUES (7, 'old', 1, 'error', 2, '受信・印刷結果は不明です。')")
+        migrated = Storage(legacy_path)
+        self.assertTrue(migrated.get(7).outcome_uncertain)
+        self.assertEqual(migrated.get(7).attempts, 2)
+        self.assertEqual(migrated.allocate(False, "new").number, 8)
+        self.assertTrue(Storage(legacy_path).get(7).outcome_uncertain)
+
+    def test_recovery_marks_in_progress_printing_as_uncertain(self):
+        ticket = self.store.allocate(False, "now")
+        self.store.update(ticket.number, "printing")
+        self.store.recover_interrupted()
+        self.assertTrue(self.store.get(ticket.number).outcome_uncertain)
 
 
 if __name__ == "__main__":

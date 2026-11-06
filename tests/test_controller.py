@@ -111,6 +111,7 @@ class ControllerTests(unittest.TestCase):
             self.assertFalse(self.controller.accept(True))
             self.assertFalse(self.controller.retry())
             self.assertFalse(self.controller.discard())
+            self.assertFalse(self.controller.shutdown())
             self.assertIsNone(self.controller.preview_image())
         finally:
             finish.set()
@@ -244,6 +245,42 @@ class ControllerTests(unittest.TestCase):
         self.printer.print_image.side_effect = RuntimeError("unknown failure")
         self.controller.accept(False)
         self.assertIn("重複", self.controller.snapshot().message)
+
+    def test_uncertain_result_survives_a_later_pre_send_failure(self):
+        self.printer.print_image.side_effect = [UncertainFailure("transfer interrupted"),
+                                                CertainFailure("connection refused")]
+        self.controller.accept(False)
+        self.clock.advance()
+        self.controller.retry()
+        self.assertIn("重複", self.controller.snapshot().message)
+        saved = Storage(self.store.path).get(1)
+        self.assertTrue(saved.outcome_uncertain)
+        self.assertIn("重複", saved.error)
+        restarted = self.make_controller()
+        self.assertEqual(restarted.snapshot().state, "interrupted")
+        self.assertIn("重複", restarted.snapshot().message)
+
+    def test_successful_retry_keeps_earlier_uncertainty_visible(self):
+        self.printer.print_image.side_effect = [UncertainFailure("transfer interrupted"),
+                                                SimpleNamespace(test_mode=False, detail="sent")]
+        self.controller.accept(False)
+        self.clock.advance()
+        self.controller.retry()
+        self.assertEqual(self.controller.snapshot().state, "completed")
+        self.assertIn("重複", self.controller.snapshot().message)
+        self.assertTrue(self.store.get(1).outcome_uncertain)
+
+    def test_shutdown_releases_image_and_preserves_unresolved_receipt(self):
+        self.printer.print_image.side_effect = UncertainFailure("transfer interrupted")
+        self.controller.accept(False)
+        self.assertTrue(self.controller.shutdown())
+        self.assertFalse(self.controller.snapshot().has_image)
+        self.assertFalse(self.controller.snapshot().can_retry)
+        self.assertEqual(self.store.get(1).status, "error")
+        self.assertTrue(self.store.get(1).outcome_uncertain)
+        restarted = self.make_controller()
+        self.assertEqual((restarted.snapshot().state, restarted.snapshot().number), ("interrupted", 1))
+        self.assertFalse(restarted.accept(False))
 
 
 if __name__ == "__main__":

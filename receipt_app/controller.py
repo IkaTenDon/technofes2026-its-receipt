@@ -33,12 +33,14 @@ class Controller:
         self._busy = False
         self._last_finished = float("-inf")
         self._live_preparation_retry = False
+        self._outcome_uncertain = False
         self._ticket: Ticket | None = None
         self._state, self._message = "waiting", "ボタン入力を待っています。"
         store.recover_interrupted()
         latest = store.latest()
         if latest and latest.status in {"error", "interrupted"}:
             self._ticket = latest
+            self._outcome_uncertain = latest.outcome_uncertain
             self._state = "interrupted"
             self._message = (f"前回の受付 {latest.number} は未解決です。{latest.error}\n"
                              "再起動により画像を失ったため再印刷できません。確認して受付を閉じてください。")
@@ -74,6 +76,7 @@ class Controller:
                 return False
             self._clear_image()
             self._ticket = None
+            self._outcome_uncertain = False
             self._live_preparation_retry = True
         try:
             self._ticket = self.store.allocate(with_photo, self.now())
@@ -121,13 +124,17 @@ class Controller:
             send_started = True
             result = self.printer.print_image(self._image)
             status = "test_completed" if result.test_mode else "completed"
-            self.store.update(ticket.number, status)
-            self._set("completed", result.detail)
+            self.store.update(ticket.number, status, outcome_uncertain=self._outcome_uncertain)
+            message = result.detail
+            if self._outcome_uncertain:
+                message += "\n以前の印刷結果は不明です。同じ番号の紙が重複している可能性があります。"
+            self._set("completed", message)
         except Exception as exc:
             # A transport adapter distinguishes pre-send errors from uncertain sends.
             uncertain = getattr(exc, "uncertain", send_started)
+            self._outcome_uncertain = self._outcome_uncertain or uncertain
             message = str(exc) or type(exc).__name__
-            if uncertain:
+            if self._outcome_uncertain:
                 message += "\n受信・印刷結果は不明です。同番号の再印刷でも重複する可能性があります。"
             elif self._image is None:
                 message += "\n再試行は同じ番号です。写真ありの場合は撮り直します。"
@@ -139,7 +146,8 @@ class Controller:
     def _record_error(self, message: str):
         if self._ticket:
             try:
-                self.store.update(self._ticket.number, "error", message)
+                self.store.update(self._ticket.number, "error", message,
+                                  outcome_uncertain=self._outcome_uncertain)
             except Exception as exc:
                 message += f"\n状態をSQLiteへ保存できませんでした: {exc}"
         else:
@@ -178,7 +186,16 @@ class Controller:
             self._clear_image()
             self._live_preparation_retry = False
             self._ticket = None
+            self._outcome_uncertain = False
             self._state, self._message = "waiting", "ボタン入力を待っています。"
+            return True
+
+    def shutdown(self) -> bool:
+        with self._lock:
+            if self._busy:
+                return False
+            self._clear_image()
+            self._live_preparation_retry = False
             return True
 
     def preview_image(self):
