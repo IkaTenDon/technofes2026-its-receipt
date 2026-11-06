@@ -1,5 +1,11 @@
 # TiMini Print の調査と採用した印刷経路
 
+X18 系の広告名は、固定版カタログで `pocket_printer` モデル、`d1` プロファイル、TINY プロトコルとして検出される。この runtime はバッファの停止・再開通知を扱うが、`wait_for_completion()` を実装しておらず、基底クラスの何もしない処理になる。ジョブの `wait_for_completion=True` だけでは、紙面への印刷完了待ちがあるとは判断できない。[Tiny runtime](https://github.com/Dejniel/TiMini-Print/blob/4aaf9459f1d7854bdca5bafffd86756704b76376/timiniprint/printing/runtime/tiny.py)、[完了待ちの基底処理](https://github.com/Dejniel/TiMini-Print/blob/4aaf9459f1d7854bdca5bafffd86756704b76376/timiniprint/printing/runtime/base.py#L133)
+
+従来の受付アプリは、送信 API が戻った直後に毎回切断し、`asyncio.run()` のループも閉じていた。TiMini GUI で長い画像を印刷でき、受付アプリではエラーなしで同じ位置から途切れるという報告に対し、この接続寿命の違いを修正した。上流の送信処理にも、バイト書込完了後の早期切断が印刷を途中で切る可能性が明記されている。新実装では専用ループで接続と受信処理を保ち、次のジョブに再利用し、アプリ終了時だけ切断する。固定秒数の待機や未確認の ACK は追加しない。[上流の送信処理](https://github.com/Dejniel/TiMini-Print/blob/4aaf9459f1d7854bdca5bafffd86756704b76376/timiniprint/printing/send.py)、[GUI のループ所有](https://github.com/Dejniel/TiMini-Print/blob/4aaf9459f1d7854bdca5bafffd86756704b76376/timiniprint/app/gui.py#L54)
+
+この変更は、アプリ側が途中で接続を閉じる経路を除去するものであり、実機症状の解消確認はまだ行っていない。印字幅テストは送信後も接続を保持し、操作者が紙面確認後に Enter を押した時点で終了する。実機では同じ画像の末尾と QR まで印字されることを確認する必要がある。
+
 接続初期化の失敗に `ConnectionCleanupError` が cause として含まれる場合は、上流の `ConnectionCleanupError.is_cause_of()` で検出する。接続済みセッションの `disconnect()` が失敗・中断した場合も含め、そのプリンター制御インスタンスで以後の接続を停止し、受付アプリの再起動を要求する。これは印刷結果の不明判定とは別である。画像送信前なら重複印刷を示唆せず、送信後なら再試行を押した場合も結果不明の警告を維持する。送信エラーに続いて解放も失敗しても、送信開始の事実を失わない。通常の接続エラーに別の例外が cause として付いているだけでは、この停止判定にはしない。[解放失敗 marker の契約](https://github.com/Dejniel/TiMini-Print/blob/4aaf9459f1d7854bdca5bafffd86756704b76376/timiniprint/transport/base.py#L13)
 
 この開発環境の Windows / Python 3.13 では、`winsdk` の対応 wheel を取得できず、ソースビルドに必要な Visual Studio Build Tools がないため上流依存関係の導入に失敗した。これは実際の環境構築で確認した制約である。Python 3.13 のテスト結果を Bluetooth 実行環境の構築成功と扱わず、Python 3.12 の環境を別途用意して完全な依存関係を検証する。

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -67,6 +69,20 @@ class PrinterTests(unittest.TestCase):
         self.cfg = AppConfig(Path.cwd(), test_mode=False,
                              printer=PrinterConfig(bluetooth_target="AA:BB:CC:DD:EE:FF"))
         self.image = Image.new("1", (384, 20), 1)
+        self.adapters = []
+
+    def tearDown(self):
+        for adapter in self.adapters:
+            try:
+                adapter.close()
+            except PrintFailure:
+                pass
+        self.image.close()
+
+    def adapter(self, cfg=None):
+        adapter = TiMiniPrinter(cfg or self.cfg)
+        self.adapters.append(adapter)
+        return adapter
 
     def fake_api(self, printer, selected_paper=None, connect_error=None):
         self.targets = []
@@ -113,7 +129,7 @@ class PrinterTests(unittest.TestCase):
     def print_fake(self, printer, *, cfg=None, selected_paper=None, connect_error=None):
         api = self.fake_api(printer, selected_paper, connect_error)
         with patch("receipt_app.printer._load_timini", return_value=api):
-            return TiMiniPrinter(cfg or self.cfg).print_image(self.image)
+            return self.adapter(cfg).print_image(self.image)
 
     def test_dry_run_neither_writes_nor_loads_backend(self):
         with patch("receipt_app.printer._load_timini", side_effect=AssertionError("backend called")):
@@ -140,15 +156,20 @@ class PrinterTests(unittest.TestCase):
             with self.assertRaises(PrintFailure):
                 TiMiniPrinter(cfg).print_image(self.image)
 
-    def test_sends_once_and_disconnects(self):
+    def test_sends_once_and_keeps_connection_until_explicit_close(self):
         printer = FakePrinter()
         result = self.print_fake(printer)
         self.assertFalse(result.test_mode)
         self.assertEqual(len(printer.jobs), 1)
-        self.assertTrue(printer.closed)
+        self.assertFalse(printer.closed)
         self.assertEqual(self.targets, [self.cfg.printer.bluetooth_target])
         self.assertEqual(len(printer.jobs[0].raster.pixels), 384 * 20)
         self.assertFalse(printer.jobs[0].settings.trim_side_margins)
+        adapter = self.adapters[-1]
+        self.assertTrue(adapter._thread.is_alive())
+        adapter.close()
+        self.assertTrue(printer.closed)
+        self.assertFalse(adapter._thread.is_alive())
 
     def test_forced_model_uses_selected_target(self):
         cfg = replace(self.cfg, printer=replace(self.cfg.printer, model_key="chosen-model"))
@@ -187,8 +208,9 @@ class PrinterTests(unittest.TestCase):
         self.assertTrue(printer.closed)
 
     def test_cleanup_failure_after_send_is_uncertain(self):
+        self.print_fake(FakePrinter(fail_close=True))
         with self.assertRaises(PrintFailure) as caught:
-            self.print_fake(FakePrinter(fail_close=True))
+            self.adapters[-1].close()
         self.assertTrue(caught.exception.uncertain)
 
     def test_cleanup_failure_blocks_later_connection_and_preserves_uncertainty(self):
@@ -196,10 +218,14 @@ class PrinterTests(unittest.TestCase):
             with self.subTest(send_failed=send_failed):
                 printer = FakePrinter(fail_send=send_failed, fail_close=True)
                 api = self.fake_api(printer)
-                adapter = TiMiniPrinter(self.cfg)
+                adapter = self.adapter()
                 with patch("receipt_app.printer._load_timini", return_value=api) as load:
                     with self.assertRaises(PrintFailure) as first:
-                        adapter.print_image(self.image)
+                        if send_failed:
+                            adapter.print_image(self.image)
+                        else:
+                            adapter.print_image(self.image)
+                            adapter.close()
                     with self.assertRaises(PrintFailure) as second:
                         adapter.print_image(self.image)
                 self.assertTrue(first.exception.uncertain)
@@ -211,7 +237,7 @@ class PrinterTests(unittest.TestCase):
     def test_cleanup_failure_before_send_blocks_reconnect_without_duplicate_claim(self):
         printer = FakePrinter(fail_close=True)
         api = self.fake_api(printer, selected_paper=paper(render_width_px=576))
-        adapter = TiMiniPrinter(self.cfg)
+        adapter = self.adapter()
         with patch("receipt_app.printer._load_timini", return_value=api) as load:
             for _ in range(2):
                 with self.assertRaises(PrintFailure) as caught:
@@ -224,7 +250,7 @@ class PrinterTests(unittest.TestCase):
     def test_preparation_cleanup_marker_blocks_reconnect(self):
         error = RuntimeError("preparation failed")
         error.__cause__ = FakeCleanupError("cleanup failed")
-        adapter = TiMiniPrinter(self.cfg)
+        adapter = self.adapter()
         api = self.fake_api(FakePrinter(), connect_error=error)
         with patch("receipt_app.printer._load_timini", return_value=api) as load:
             for _ in range(2):
@@ -237,7 +263,7 @@ class PrinterTests(unittest.TestCase):
     def test_ordinary_chained_connection_error_allows_retry(self):
         error = RuntimeError("connection failed")
         error.__cause__ = OSError("ordinary cause")
-        adapter = TiMiniPrinter(self.cfg)
+        adapter = self.adapter()
         printer = FakePrinter()
         with patch("receipt_app.printer._load_timini", return_value=self.fake_api(printer, connect_error=error)):
             with self.assertRaises(PrintFailure):
@@ -253,6 +279,80 @@ class PrinterTests(unittest.TestCase):
             self.print_fake(printer, cfg=cfg)
         self.assertTrue(caught.exception.uncertain)
         self.assertTrue(printer.closed)
+
+    def test_consecutive_jobs_reuse_one_prepared_connection(self):
+        printer = FakePrinter()
+        adapter = self.adapter()
+        with patch("receipt_app.printer._load_timini", return_value=self.fake_api(printer)):
+            adapter.print_image(self.image)
+            adapter.print_image(self.image)
+        self.assertEqual(self.targets, [self.cfg.printer.bluetooth_target])
+        self.assertEqual(len(printer.jobs), 2)
+        self.assertFalse(printer.closed)
+        adapter.close()
+        self.assertTrue(printer.closed)
+        self.assertFalse(adapter._thread.is_alive())
+
+    def test_receiver_loop_stays_alive_after_send_returns(self):
+        notification = threading.Event()
+
+        class NotificationPrinter(FakePrinter):
+            async def send_job(self, job, **kwargs):
+                await super().send_job(job, **kwargs)
+
+                async def receive():
+                    await asyncio.sleep(0.02)
+                    notification.set()
+
+                asyncio.create_task(receive())
+
+        printer = NotificationPrinter()
+        self.print_fake(printer)
+        self.assertTrue(notification.wait(timeout=2))
+        self.assertFalse(printer.closed)
+
+    def test_close_timeout_returns_and_cleanup_stops_loop_when_io_settles(self):
+        release = threading.Event()
+
+        class SlowClosePrinter(FakePrinter):
+            async def disconnect(self):
+                while not release.is_set():
+                    await asyncio.sleep(0.005)
+                self.closed = True
+
+        cfg = replace(self.cfg, printer=replace(self.cfg.printer, operation_timeout_s=0.05))
+        printer = SlowClosePrinter()
+        self.print_fake(printer, cfg=cfg)
+        adapter = self.adapters[-1]
+        started = time.monotonic()
+        try:
+            with self.assertRaises(PrintFailure) as caught:
+                adapter.close()
+            self.assertTrue(caught.exception.uncertain)
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            release.set()
+            adapter._thread.join(timeout=2)
+        self.assertTrue(printer.closed)
+        self.assertFalse(adapter._thread.is_alive())
+
+    def test_close_without_printing_does_not_start_loop(self):
+        adapter = self.adapter()
+        adapter.close()
+        self.assertIsNone(adapter._thread)
+        with self.assertRaises(PrintFailure):
+            adapter.print_image(self.image)
+
+    def test_event_loop_start_failure_is_reported_and_thread_finishes(self):
+        adapter = self.adapter()
+        with patch("receipt_app.printer._load_timini", return_value=self.fake_api(FakePrinter())), \
+                patch("receipt_app.printer.asyncio.new_event_loop", side_effect=OSError("loop unavailable")):
+            with self.assertRaises(PrintFailure) as caught:
+                adapter.print_image(self.image)
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        adapter._thread.join(timeout=1)
+        self.assertFalse(adapter._thread.is_alive())
+        self.assertEqual(self.targets, [])
 
     def test_source_marker_validation(self):
         with tempfile.TemporaryDirectory() as temp:

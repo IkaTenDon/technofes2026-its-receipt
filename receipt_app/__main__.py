@@ -58,7 +58,13 @@ def main(argv=None) -> int:
                 if args.print_pattern:
                     printer = DryRunPrinter() if cfg.test_mode else TiMiniPrinter(cfg)
                     with InstanceLock(cfg.resolve(cfg.database_path).with_suffix(".lock")):
-                        print(printer.print_image(image).detail)
+                        try:
+                            result = printer.print_image(image)
+                            print(result.detail)
+                            if not result.test_mode:
+                                input("用紙が最後まで印刷されたことを確認してから Enter を押してください: ")
+                        finally:
+                            printer.close()
             finally:
                 image.close()
             return 0
@@ -75,13 +81,16 @@ def main(argv=None) -> int:
             store = Storage(database)
             printer = DryRunPrinter() if cfg.test_mode else TiMiniPrinter(cfg)
             camera = LiveCamera(cfg.camera)
-            controller = Controller(cfg, store, lambda _: camera.snapshot(), render_receipt, printer)
-            root = tk.Tk()
             try:
+                controller = Controller(cfg, store, lambda _: camera.snapshot(), render_receipt, printer)
+                root = tk.Tk()
                 ReceiptWindow(root, cfg, controller, camera)
                 root.mainloop()
             finally:
-                camera.stop()
+                try:
+                    camera.stop()
+                finally:
+                    printer.close()
         return 0
     except Exception as exc:
         print(f"エラー: {exc}", file=sys.stderr)
