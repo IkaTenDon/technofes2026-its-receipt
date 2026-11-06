@@ -1,0 +1,884 @@
+from __future__ import annotations
+
+import asyncio
+import selectors
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, call, patch
+
+from timiniprint import reporting
+from timiniprint.devices import BluetoothTarget, PrinterCatalog
+from timiniprint.devices.device import BluetoothEndpoint, BluetoothEndpointTransport
+from timiniprint.protocol import ProtocolJob, ProtocolStep
+from timiniprint.transport.bluetooth.backend import (
+    SppBackend,
+    _CONNECT_TIMEOUT_SEC,
+    _MACOS_FALLBACK_COOLDOWN_SEC,
+    _resolve_rfcomm_channels,
+)
+from timiniprint.transport.bluetooth.connector import (
+    BleakBluetoothConnection,
+    BleakBluetoothConnector,
+)
+from timiniprint.transport.bluetooth.types import DeviceInfo, DeviceTransport
+
+
+class _Socket:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.closed = False
+        self.target = None
+        self.sent = []
+        self.timeout = None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def connect(self, target):
+        self.target = target
+        if self.fail:
+            raise RuntimeError("connect failed")
+
+    def close(self):
+        self.closed = True
+
+    def sendall(self, data):
+        self.sent.append(bytes(data))
+
+
+class _QuerySocket(_Socket):
+    def __init__(self, replies):
+        super().__init__(fail=False)
+        self._replies = [bytes(reply) for reply in replies]
+        self._timeout = None
+
+    def gettimeout(self):
+        return self._timeout
+
+    def settimeout(self, timeout):
+        self._timeout = timeout
+
+    def recv(self, _size):
+        if self._replies:
+            return self._replies.pop(0)
+        raise TimeoutError()
+
+
+class _BlockingQuerySocket(_Socket):
+    def __init__(self):
+        super().__init__(fail=False)
+        self._condition = threading.Condition()
+        self._replies = []
+        self.first_sent = threading.Event()
+        self.second_sent = threading.Event()
+
+    def gettimeout(self):
+        return self.timeout
+
+    def sendall(self, data):
+        with self._condition:
+            self.sent.append(bytes(data))
+            if len(self.sent) == 1:
+                self.first_sent.set()
+            elif len(self.sent) == 2:
+                self.second_sent.set()
+            self._condition.notify_all()
+
+    def recv(self, _size):
+        with self._condition:
+            if not self._replies:
+                self._condition.wait(timeout=0.1)
+            if self._replies:
+                return self._replies.pop(0)
+        raise TimeoutError()
+
+    def queue_reply(self, reply):
+        with self._condition:
+            self._replies.append(bytes(reply))
+            self._condition.notify_all()
+
+
+class _BleNotificationQuerySocket(_Socket):
+    def __init__(self, *, can_send_wait: bool = True):
+        super().__init__(fail=False)
+        self.can_send_wait = can_send_wait
+
+    def can_send_control_packet_wait_notification(self):
+        return self.can_send_wait
+
+    def send_control_packet_wait_notification(
+        self,
+        packet,
+        *,
+        label,
+        match,
+        timeout,
+        required=True,
+    ):
+        _ = label, timeout, required
+        self.sent.append(bytes(packet))
+        reply = b"ACK"
+        return reply if match(reply) else None
+
+
+class _BleWaitSocket(_Socket):
+    def can_wait_for_notification(self):
+        return True
+
+    def wait_for_notification(self, label, match, *, timeout, required=True):
+        _ = label, timeout, required
+        reply = b"ACK"
+        return reply if match(reply) else None
+
+
+class _BulkSocket(_Socket):
+    def __init__(self, *, can_send_bulk: bool = True):
+        super().__init__(fail=False)
+        self.can_send_bulk = can_send_bulk
+        self.bulk_timeouts = []
+
+    def can_send_bulk_payload(self):
+        return self.can_send_bulk
+
+    def send_bulk_payload(self, data, *, timeout=1.0):
+        self.sent.append(bytes(data))
+        self.bulk_timeouts.append(timeout)
+        return True
+
+
+class _Reporter:
+    def __init__(self):
+        self.debugs = []
+
+    def trace(self, **_kwargs):
+        pass
+
+    def debug(self, *, short=None, detail=None, **_kwargs):
+        self.debugs.append((short, detail))
+
+
+class _RuntimeControllerSpy:
+    def __init__(self) -> None:
+        self.payloads = []
+        self.received = threading.Event()
+
+    def handle_notification(self, _session, payload):
+        self.payloads.append(bytes(payload))
+        self.received.set()
+
+
+class _FlowRuntimeController:
+    def handle_notification(self, session, payload):
+        if payload == b"pause":
+            session.set_flow_paused(True, payload=payload)
+        elif payload == b"resume":
+            session.set_flow_paused(False, payload=payload)
+
+
+class _Adapter:
+    def __init__(self, channels, fail=False, pair_error=None):
+        self._channels = channels
+        self._fail = fail
+        self._pair_error = pair_error
+        self.ble_mtu_request = None
+        self.ble_profile = None
+
+    def resolve_rfcomm_channels(self, _address):
+        return self._channels
+
+    def ensure_paired(self, _address, _pairing_hint=None):
+        if self._pair_error:
+            raise self._pair_error
+
+    def create_socket(self, _pairing_hint=None, ble_profile=None, reporter=None, ble_mtu_request=None):
+        _ = reporter
+        self.ble_profile = ble_profile
+        self.ble_mtu_request = ble_mtu_request
+        return _Socket(fail=self._fail)
+
+
+class _BleScanAdapter:
+    def __init__(self, devices):
+        self._devices = list(devices)
+
+    def scan_blocking(self, _timeout: float):
+        return list(self._devices)
+
+
+class BluetoothBackendConnectTests(unittest.TestCase):
+    def test_classic_payload_preview_is_trace_only(self) -> None:
+        from tests.helpers import build_capture_reporter
+
+        reporter, sink = build_capture_reporter(min_level=reporting.ReportLevel.TRACE)
+        backend = SppBackend(reporter=reporter)
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        payload = b"private-raster"
+        backend._write_blocking(payload, chunk_size=20, delay_ms=0)
+        self.assertEqual(sock.sent, [payload])
+        normal = [message.detail or "" for message in sink.messages if message.level == reporting.ReportLevel.DEBUG]
+        trace = [message.detail or "" for message in sink.messages if message.level == reporting.ReportLevel.TRACE]
+        self.assertTrue(any("bytes=14" in line for line in normal))
+        self.assertFalse(any(payload.hex() in line or "head=" in line for line in normal))
+        self.assertTrue(any(payload.hex() in line for line in trace))
+
+    def setUp(self) -> None:
+        # These tests control recv() chunks with fake sockets. OS readiness is
+        # covered separately by StreamReceiveHub's real-socket tests.
+        selector_patch = patch(
+            "timiniprint.transport._stream_receive.selectors"
+        )
+        selector_module = selector_patch.start()
+        self.addCleanup(selector_patch.stop)
+        selector_module.EVENT_READ = selectors.EVENT_READ
+        selector_module.DefaultSelector.return_value.select.return_value = [
+            (None, selectors.EVENT_READ)
+        ]
+
+    def test_connection_rejects_job_with_execution_steps(self) -> None:
+        endpoint = BluetoothEndpoint(
+            name="MXW01",
+            address="UUID-1",
+            transport=BluetoothEndpointTransport.BLE,
+        )
+        target = BluetoothTarget(
+            classic_endpoint=None,
+            ble_endpoint=endpoint,
+            display_address=endpoint.address,
+            transport_badge="BLE",
+        )
+        device = PrinterCatalog.load().device_from_profile(
+            "v5x",
+            transport_target=target,
+        )
+        backend = SimpleNamespace(write=AsyncMock())
+        connection = BleakBluetoothConnection(backend, device, reporting.DUMMY_REPORTER)
+        job = ProtocolJob(steps=(ProtocolStep.send("print data", b"abc"),))
+
+        async def run() -> None:
+            with self.assertRaisesRegex(RuntimeError, "ConnectedPrinter.send_job"):
+                await connection.send(job)
+
+        asyncio.run(run())
+        backend.write.assert_not_awaited()
+
+    def test_resolve_rfcomm_channels_uses_explicit_then_fallback(self) -> None:
+        adapter = _Adapter([7, "x", 3, 7])
+        self.assertEqual(_resolve_rfcomm_channels(adapter, "AA"), [7, 3])
+        empty = _Adapter([])
+        self.assertEqual(_resolve_rfcomm_channels(empty, "AA"), [1])
+
+    def test_connect_attempts_success_first(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        dev = DeviceInfo("X", "AA", transport=DeviceTransport.CLASSIC)
+        with patch("timiniprint.transport.bluetooth.backend._select_adapter", return_value=_Adapter([1], fail=False)):
+            backend._connect_attempts_blocking([dev], pairing_hint=False)
+        self.assertTrue(backend.is_connected())
+        self.assertEqual(getattr(backend, "_sock").timeout, _CONNECT_TIMEOUT_SEC)
+
+    def test_connect_attempts_passes_ble_mtu_request_to_adapter(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        dev = DeviceInfo(
+            "X",
+            "UUID",
+            transport=DeviceTransport.BLE,
+            ble_mtu_request=512,
+        )
+        adapter = _Adapter([1], fail=False)
+        with patch("timiniprint.transport.bluetooth.backend._select_adapter", return_value=adapter):
+            backend._connect_attempts_blocking([dev], pairing_hint=False)
+
+        self.assertEqual(adapter.ble_mtu_request, 512)
+
+    def test_connect_attempts_passes_ble_profile_to_adapter(self) -> None:
+        device = PrinterCatalog.load().detect_device("MXW01")
+        self.assertIsNotNone(device)
+        profile = device.ble_transport_profile
+        attempt = DeviceInfo(
+            "MXW01",
+            "UUID",
+            transport=DeviceTransport.BLE,
+            ble_profile=profile,
+        )
+        adapter = _Adapter([1], fail=False)
+
+        with patch("timiniprint.transport.bluetooth.backend._select_adapter", return_value=adapter):
+            SppBackend(reporter=reporting.DUMMY_REPORTER)._connect_attempts_blocking(
+                [attempt],
+                pairing_hint=False,
+            )
+
+        self.assertIs(adapter.ble_profile, profile)
+
+    def test_connector_maps_profile_ble_mtu_request_only_for_ble_endpoint(self) -> None:
+        device = PrinterCatalog.load().detect_device("X9-38CC")
+        self.assertIsNotNone(device)
+        ble = BluetoothEndpoint(
+            name="X9-38CC",
+            address="UUID-1",
+            transport=BluetoothEndpointTransport.BLE,
+        )
+        classic = BluetoothEndpoint(
+            name="X9-38CC",
+            address="AA:BB:CC:DD:EE:FF",
+            transport=BluetoothEndpointTransport.CLASSIC,
+        )
+
+        ble_info = BleakBluetoothConnector._to_device_info(ble, device)
+        classic_info = BleakBluetoothConnector._to_device_info(classic, device)
+
+        self.assertEqual(ble_info.ble_mtu_request, 512)
+        self.assertIsNone(classic_info.ble_mtu_request)
+        self.assertIs(ble_info.ble_profile, device.ble_transport_profile)
+        self.assertIsNone(classic_info.ble_profile)
+
+    def test_connect_attempts_fallback_and_final_error(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        d1 = DeviceInfo("X", "AA", transport=DeviceTransport.CLASSIC)
+        d2 = DeviceInfo("X", "UUID", transport=DeviceTransport.BLE)
+
+        def adapter_for(t):
+            return _Adapter([1], fail=True if t == DeviceTransport.CLASSIC else False)
+
+        with patch("timiniprint.transport.bluetooth.backend._select_adapter", side_effect=adapter_for):
+            backend._connect_attempts_blocking([d1, d2], pairing_hint=False)
+        self.assertEqual(getattr(backend, "_transport"), DeviceTransport.BLE)
+
+        backend2 = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        with patch("timiniprint.transport.bluetooth.backend._select_adapter", return_value=_Adapter([1], fail=True)):
+            with self.assertRaisesRegex(RuntimeError, "connect failed"):
+                backend2._connect_attempts_blocking([d1], pairing_hint=False)
+
+    def test_macos_fallback_applies_cooldown(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        d1 = DeviceInfo("X", "AA", transport=DeviceTransport.CLASSIC)
+        d2 = DeviceInfo("X", "UUID", transport=DeviceTransport.BLE)
+
+        def adapter_for(t):
+            return _Adapter([1], fail=True if t == DeviceTransport.CLASSIC else False)
+
+        with patch("timiniprint.transport.bluetooth.backend.IS_MACOS", True), patch(
+            "timiniprint.transport.bluetooth.backend._select_adapter",
+            side_effect=adapter_for,
+        ), patch(
+            "timiniprint.transport.bluetooth.backend._get_ble_adapter",
+            return_value=_BleScanAdapter([d2]),
+        ), patch("timiniprint.transport.bluetooth.backend.time.sleep") as sleep_mock:
+            backend._connect_attempts_blocking([d1, d2], pairing_hint=False)
+
+        self.assertIn(call(_MACOS_FALLBACK_COOLDOWN_SEC), sleep_mock.mock_calls)
+
+    def test_macos_ble_refresh_updates_fallback_address(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        d1 = DeviceInfo("X6H", "AA:BB:CC:DD:EE:FF", transport=DeviceTransport.CLASSIC)
+        stale_ble = DeviceInfo("X6H", "OLD-UUID", transport=DeviceTransport.BLE)
+        refreshed_ble = DeviceInfo("X6H", "NEW-UUID", transport=DeviceTransport.BLE)
+
+        def adapter_for(t):
+            return _Adapter([1], fail=True if t == DeviceTransport.CLASSIC else False)
+
+        with patch("timiniprint.transport.bluetooth.backend.IS_MACOS", True), patch(
+            "timiniprint.transport.bluetooth.backend._select_adapter",
+            side_effect=adapter_for,
+        ), patch(
+            "timiniprint.transport.bluetooth.backend._get_ble_adapter",
+            return_value=_BleScanAdapter([refreshed_ble]),
+        ):
+            backend._connect_attempts_blocking([d1, stale_ble], pairing_hint=False)
+
+        self.assertEqual(getattr(backend, "_transport"), DeviceTransport.BLE)
+        self.assertEqual(getattr(backend, "_sock").target, ("NEW-UUID", 1))
+
+    def test_write_blocking_ble_skips_outer_chunking(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.BLE
+
+        with patch("timiniprint.transport.bluetooth.backend.time.sleep") as sleep_mock:
+            backend._write_blocking(b"abcdef", chunk_size=2, delay_ms=5)
+
+        self.assertEqual(sock.sent, [b"abcdef"])
+        sleep_mock.assert_not_called()
+
+    def test_write_blocking_classic_keeps_outer_chunking(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+
+        with patch("timiniprint.transport.bluetooth.backend.time.sleep") as sleep_mock:
+            backend._write_blocking(b"abcdef", chunk_size=2, delay_ms=5)
+
+        self.assertEqual(sock.sent, [b"ab", b"cd", b"ef"])
+        self.assertGreaterEqual(sleep_mock.call_count, 1)
+
+    def test_write_blocking_classic_waits_for_runtime_flow_resume(self) -> None:
+        reporter = _Reporter()
+        backend = SppBackend(
+            reporter=reporter,
+            classic_flow_resume_timeout_s=0.5,
+        )
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        backend._classic_runtime_controller = _FlowRuntimeController()
+        backend._handle_classic_payload(b"pause")
+        errors = []
+
+        def write() -> None:
+            try:
+                backend._write_blocking(b"abcdef", chunk_size=2, delay_ms=0)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        thread.join(timeout=0.05)
+
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(sock.sent, [])
+
+        backend._handle_classic_payload(b"resume")
+        thread.join(timeout=0.5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sock.sent, [b"ab", b"cd", b"ef"])
+        details = [detail for _short, detail in reporter.debugs]
+        self.assertIn("Classic Bluetooth flow pause", details)
+        self.assertIn("Classic Bluetooth flow resume", details)
+
+    def test_write_blocking_classic_stops_between_chunks(self) -> None:
+        backend = SppBackend(
+            reporter=reporting.DUMMY_REPORTER,
+            classic_flow_resume_timeout_s=0.5,
+        )
+        first_chunk_sent = threading.Event()
+
+        class _PauseAfterFirstChunkSocket(_Socket):
+            def sendall(self, data):
+                super().sendall(data)
+                if len(self.sent) == 1:
+                    backend._classic_runtime_session.set_flow_paused(True)
+                    first_chunk_sent.set()
+
+        sock = _PauseAfterFirstChunkSocket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        errors = []
+
+        def write() -> None:
+            try:
+                backend._write_blocking(b"abcdef", chunk_size=2, delay_ms=0)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        self.assertTrue(first_chunk_sent.wait(timeout=0.2))
+        thread.join(timeout=0.05)
+
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(sock.sent, [b"ab"])
+
+        backend._classic_runtime_session.set_flow_paused(False)
+        thread.join(timeout=0.5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sock.sent, [b"ab", b"cd", b"ef"])
+
+    def test_write_blocking_ble_does_not_use_classic_flow_gate(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.BLE
+        backend._classic_runtime_session.set_flow_paused(True)
+
+        backend._write_blocking(b"abcdef", chunk_size=2, delay_ms=0)
+
+        self.assertEqual(sock.sent, [b"abcdef"])
+
+    def test_write_blocking_classic_flow_wait_times_out(self) -> None:
+        backend = SppBackend(
+            reporter=reporting.DUMMY_REPORTER,
+            classic_flow_resume_timeout_s=0.01,
+        )
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        backend._classic_runtime_controller = _FlowRuntimeController()
+        backend._handle_classic_payload(b"pause")
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "Classic Bluetooth flow-control resume",
+        ):
+            backend._write_blocking(b"ab", chunk_size=2, delay_ms=0)
+
+        self.assertEqual(sock.sent, [])
+
+    def test_disconnect_releases_classic_flow_waiter(self) -> None:
+        backend = SppBackend(
+            reporter=reporting.DUMMY_REPORTER,
+            classic_flow_resume_timeout_s=1.0,
+        )
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        backend._classic_runtime_controller = _FlowRuntimeController()
+        backend._handle_classic_payload(b"pause")
+        errors = []
+
+        def write() -> None:
+            try:
+                backend._write_blocking(b"ab", chunk_size=2, delay_ms=0)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        backend._disconnect_blocking()
+        thread.join(timeout=0.5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(
+            str(errors[0]),
+            "disconnected while waiting for flow-control resume",
+        )
+        self.assertEqual(sock.sent, [])
+
+    def test_write_blocking_classic_reports_chunk_progress_for_large_payload(self) -> None:
+        reporter = _Reporter()
+        backend = SppBackend(reporter=reporter)
+        sock = _Socket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+
+        with patch("timiniprint.transport.bluetooth.backend.time.sleep"):
+            backend._write_blocking(b"x" * 40, chunk_size=2, delay_ms=5)
+
+        details = [detail for _short, detail in reporter.debugs]
+        self.assertTrue(any("Classic payload send: bytes=40 chunk=2 chunks=20 delay_ms=5" in item for item in details))
+        self.assertTrue(any("Classic payload progress: chunk=5/20 bytes=10/40" in item for item in details))
+        self.assertTrue(any("Classic payload progress: chunk=10/20 bytes=20/40" in item for item in details))
+        self.assertTrue(any("Classic payload progress: chunk=15/20 bytes=30/40" in item for item in details))
+        self.assertTrue(any("Classic payload sent: bytes=40 chunks=20" in item for item in details))
+
+    def test_query_control_packet_blocking_reads_classic_reply(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        self.addCleanup(backend._stop_classic_receive_hub)
+        sock = _QuerySocket([b"PPA2L_GY"])
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+
+        reply = backend._query_control_packet_blocking(b"\x10\xff\x20\xf0", 0.1)
+
+        self.assertEqual(sock.sent, [b"\x10\xff\x20\xf0"])
+        self.assertEqual(reply, b"PPA2L_GY")
+
+    def test_query_control_packet_blocking_stops_when_reply_matches(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        self.addCleanup(backend._stop_classic_receive_hub)
+        sock = _QuerySocket([b"O", b"K", b"extra"])
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+
+        reply = backend._query_control_packet_blocking(
+            b"\x10\xff\x10\x00\x01",
+            0.1,
+            lambda data: data == b"OK",
+        )
+
+        self.assertEqual(reply, b"OK")
+        trailing = backend._wait_for_reply_blocking(
+            "trailing",
+            lambda data: data.endswith(b"extra"),
+            0.1,
+            True,
+        )
+        self.assertIsNotNone(trailing)
+        assert trailing is not None
+        self.assertTrue(trailing.endswith(b"extra"))
+
+    def test_query_control_packet_blocking_returns_unmatched_reply_at_timeout(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        self.addCleanup(backend._stop_classic_receive_hub)
+        sock = _QuerySocket([b"B", b"A", b"D"])
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+
+        reply = backend._query_control_packet_blocking(
+            b"\x10\xff\x10\x00\x01",
+            0.1,
+            lambda data: data == b"OK",
+        )
+
+        self.assertEqual(reply, b"BAD")
+
+    def test_query_control_packet_blocking_serializes_classic_transactions(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        self.addCleanup(backend._stop_classic_receive_hub)
+        sock = _BlockingQuerySocket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        replies = {}
+
+        first = threading.Thread(
+            target=lambda: replies.setdefault(
+                "first",
+                backend._query_control_packet_blocking(
+                    b"Q1",
+                    0.5,
+                    lambda data: data == b"R1",
+                ),
+            )
+        )
+        second = threading.Thread(
+            target=lambda: replies.setdefault(
+                "second",
+                backend._query_control_packet_blocking(
+                    b"Q2",
+                    0.5,
+                    lambda data: data == b"R2",
+                ),
+            )
+        )
+        first.start()
+        self.assertTrue(sock.first_sent.wait(0.2))
+        second.start()
+        try:
+            self.assertFalse(sock.second_sent.wait(0.05))
+            sock.queue_reply(b"R1")
+            self.assertTrue(sock.second_sent.wait(0.2))
+            sock.queue_reply(b"R2")
+        finally:
+            sock.queue_reply(b"R1")
+            sock.queue_reply(b"R2")
+            first.join(timeout=1.0)
+            second.join(timeout=1.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(sock.sent, [b"Q1", b"Q2"])
+        self.assertEqual(replies, {"first": b"R1", "second": b"R2"})
+
+    def test_prepared_classic_query_does_not_write_to_a_replacement_socket(self) -> None:
+        backend = SppBackend()
+        old, replacement = _QuerySocket([]), _QuerySocket([])
+        backend._sock = old
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        self.addCleanup(backend._stop_classic_receive_hub)
+
+        def replace_before_send(packet, send, **kwargs):
+            backend._sock = replacement
+            return send(packet, kwargs["timeout"])
+
+        with patch("timiniprint.transport.bluetooth.backend.StreamReceiveHub.query", side_effect=replace_before_send):
+            with self.assertRaisesRegex(ConnectionError, "connection changed"):
+                backend._query_control_packet_blocking(b"old query", 1.0)
+        self.assertEqual(old.sent, [])
+        self.assertEqual(replacement.sent, [])
+
+    def test_concurrent_first_receive_operations_share_one_inbox(self) -> None:
+        from timiniprint.transport._stream_receive import StreamReceiveHub
+
+        backend = SppBackend()
+        backend._sock = _QuerySocket([])
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        self.addCleanup(backend._stop_classic_receive_hub)
+        constructing, release = threading.Event(), threading.Event()
+        hubs, errors = [], []
+
+        def construct(*args, **kwargs):
+            constructing.set()
+            release.wait(1)
+            return StreamReceiveHub(*args, **kwargs)
+
+        def receive():
+            try:
+                hubs.append(backend._ensure_classic_receive_hub())
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=receive, daemon=True) for _ in range(2)]
+        with patch("timiniprint.transport.bluetooth.backend.StreamReceiveHub", side_effect=construct) as factory:
+            workers[0].start()
+            try:
+                self.assertTrue(constructing.wait(1))
+                workers[1].start()
+                threading.Event().wait(0.03)
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None:
+                        worker.join(1)
+            self.assertEqual(factory.call_count, 1)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(hubs), 2)
+        self.assertIs(hubs[0], hubs[1])
+
+    def test_classic_payload_never_continues_on_a_replacement_socket(self) -> None:
+        backend = SppBackend()
+        replacement = _Socket()
+
+        class OldSocket(_Socket):
+            def sendall(self, data):
+                super().sendall(data)
+                backend._sock = replacement
+
+        old = OldSocket()
+        backend._sock = old
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        with self.assertRaisesRegex(ConnectionError, "connection changed"):
+            backend._write_blocking(b"abcd", chunk_size=2, delay_ms=0)
+        self.assertEqual(old.sent, [b"ab"])
+        self.assertEqual(replacement.sent, [])
+
+    def test_can_query_control_packet_distinguishes_classic_and_ble(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        backend._sock = _Socket()
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        self.assertFalse(backend.can_query_control_packet())
+        backend._sock = _QuerySocket([])
+        self.assertTrue(backend.can_query_control_packet())
+
+        backend._transport = DeviceTransport.BLE
+        self.assertFalse(backend.can_query_control_packet())
+
+    def test_wait_for_reply_blocking_reads_classic_without_sending(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        self.addCleanup(backend._stop_classic_receive_hub)
+        sock = _QuerySocket([b"A", b"CK", b"extra"])
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+
+        self.assertTrue(backend.can_wait_for_reply())
+        reply = backend._wait_for_reply_blocking(
+            "completion",
+            lambda data: data == b"ACK",
+            0.1,
+            True,
+        )
+
+        self.assertEqual(reply, b"ACK")
+        self.assertEqual(sock.sent, [])
+        trailing = backend._wait_for_reply_blocking(
+            "trailing",
+            lambda data: data.endswith(b"extra"),
+            0.1,
+            True,
+        )
+        self.assertIsNotNone(trailing)
+        assert trailing is not None
+        self.assertTrue(trailing.endswith(b"extra"))
+
+    def test_classic_receive_hub_forwards_payloads_to_runtime_controller(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        self.addCleanup(backend._stop_classic_receive_hub)
+        backend._sock = _QuerySocket([b"err:\x02."])
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        controller = _RuntimeControllerSpy()
+
+        backend._attach_runtime_controller_blocking(controller, 0.1)
+
+        self.assertTrue(controller.received.wait(0.2))
+        self.assertEqual(controller.payloads, [b"err:\x02."])
+
+    def test_classic_runtime_replacement_and_detach(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        self.addCleanup(backend._stop_classic_receive_hub)
+        backend._sock = _QuerySocket([])
+        backend._connected = True
+        backend._transport = DeviceTransport.CLASSIC
+        first, selected = _RuntimeControllerSpy(), _RuntimeControllerSpy()
+        selected.payloads.append(b"negotiated state")
+
+        backend._attach_runtime_controller_blocking(first, 0.1)
+        backend._handle_classic_payload(b"identity")
+        backend._attach_runtime_controller_blocking(selected, 0.1)
+        backend._handle_classic_payload(b"status")
+        backend._attach_runtime_controller_blocking(None, 0.1)
+        backend._handle_classic_payload(b"after detach")
+
+        self.assertEqual(first.payloads, [b"identity"])
+        self.assertEqual(selected.payloads, [b"negotiated state", b"status"])
+
+    def test_wait_for_reply_blocking_delegates_ble_notification_wait(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        backend._sock = _BleWaitSocket()
+        backend._connected = True
+        backend._transport = DeviceTransport.BLE
+
+        self.assertTrue(backend.can_wait_for_reply())
+        reply = backend._wait_for_reply_blocking(
+            "completion",
+            lambda data: data == b"ACK",
+            0.1,
+            True,
+        )
+
+        self.assertEqual(reply, b"ACK")
+
+    def test_ble_notification_query_capability_requires_socket_support(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        backend._sock = _BleNotificationQuerySocket(can_send_wait=True)
+        backend._connected = True
+        backend._transport = DeviceTransport.BLE
+
+        self.assertTrue(backend.can_send_control_packet_wait_notification())
+        reply = backend._send_control_packet_wait_notification_blocking(
+            b"Q",
+            "ack",
+            lambda data: data == b"ACK",
+            0.1,
+            True,
+        )
+
+        self.assertEqual(reply, b"ACK")
+        self.assertEqual(backend._sock.sent, [b"Q"])
+
+        backend._sock = _BleNotificationQuerySocket(can_send_wait=False)
+        self.assertFalse(backend.can_send_control_packet_wait_notification())
+
+    def test_ble_bulk_payload_capability_and_send_delegate_to_socket(self) -> None:
+        backend = SppBackend(reporter=reporting.DUMMY_REPORTER)
+        sock = _BulkSocket()
+        backend._sock = sock
+        backend._connected = True
+        backend._transport = DeviceTransport.BLE
+
+        self.assertTrue(backend.can_send_bulk_payload())
+        self.assertTrue(backend._send_bulk_payload_blocking(b"BULK", 0.25))
+        self.assertEqual(sock.sent, [b"BULK"])
+        self.assertEqual(sock.bulk_timeouts, [0.25])
+
+        backend._sock = _BulkSocket(can_send_bulk=False)
+        self.assertFalse(backend.can_send_bulk_payload())
+
+
+if __name__ == "__main__":
+    unittest.main()

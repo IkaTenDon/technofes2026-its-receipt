@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import sys
+import types
+import unittest
+from unittest.mock import patch
+
+from PIL import Image
+
+from timiniprint.rendering.converters.pdf import PdfConverter
+
+
+class _FakePage:
+    def __init__(self, color: int = 255) -> None:
+        self._color = color
+        self.closed = False
+
+    def render_topil(self, scale=1.0):
+        _ = scale
+        return Image.new("L", (10, 10), self._color)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePdfDocument:
+    def __init__(self, _path: str, pages: int = 2) -> None:
+        self._pages = [_FakePage(255), _FakePage(180)][:pages]
+        self.closed = False
+
+    def __len__(self):
+        return len(self._pages)
+
+    def __getitem__(self, idx: int):
+        return self._pages[idx]
+
+    def close(self):
+        self.closed = True
+
+
+class _CustomPdfDocument:
+    page_count = 3
+
+    def __init__(self, size: tuple[int, int] = (10, 10)) -> None:
+        self.rendered: list[tuple[int, float]] = []
+        self.closed = False
+        self._size = size
+
+    def render_page(self, index: int, scale: float):
+        self.rendered.append((index, scale))
+        return Image.new("L", self._size, 180)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _CustomPdfRenderer:
+    def __init__(self, size: tuple[int, int] = (10, 10)) -> None:
+        self.documents: list[_CustomPdfDocument] = []
+        self._size = size
+
+    def open(self, path: str):
+        self.path = path
+        document = _CustomPdfDocument(self._size)
+        self.documents.append(document)
+        return document
+
+
+class RenderingPdfConverterTests(unittest.TestCase):
+    def test_select_page_indexes_valid_and_invalid(self) -> None:
+        c = PdfConverter(page_selection="1,3-4")
+        self.assertEqual(list(c.select_page_indexes(5)), [0, 2, 3])
+        with self.assertRaises(ValueError):
+            PdfConverter(page_selection="x").select_page_indexes(5)
+        with self.assertRaises(ValueError):
+            PdfConverter(page_selection="4-2").select_page_indexes(5)
+        with self.assertRaises(ValueError):
+            PdfConverter(page_selection="9").select_page_indexes(5)
+
+    def test_append_page_gap(self) -> None:
+        img = Image.new("L", (10, 10), 255)
+        out = PdfConverter._append_page_gap(img, 4)
+        self.assertEqual(out.size, (10, 14))
+        self.assertIs(PdfConverter._append_page_gap(img, 0), img)
+
+    def test_load_pdf_pages_with_mocked_pypdfium2(self) -> None:
+        fake = types.ModuleType("pypdfium2")
+        fake.PdfDocument = _FakePdfDocument
+        with patch.dict(sys.modules, {"pypdfium2": fake}):
+            c = PdfConverter(page_selection="1", page_gap_px=3)
+            pages = c.load("dummy.pdf", width=8)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0].image.width, 8)
+        self.assertFalse(pages[0].is_text)
+
+    def test_load_pdf_pages_accepts_custom_renderer(self) -> None:
+        renderer = _CustomPdfRenderer()
+        c = PdfConverter(page_selection="2-3", pdf_renderer=renderer)
+        pages = c.load("mobile.pdf", width=8)
+
+        self.assertEqual(renderer.path, "mobile.pdf")
+        self.assertEqual(len(pages), 2)
+        self.assertEqual([page.image.width for page in pages], [8, 8])
+        self.assertEqual(renderer.documents[0].rendered, [(1, 200 / 72.0), (2, 200 / 72.0)])
+        self.assertTrue(renderer.documents[0].closed)
+
+    def test_open_pdf_pages_renders_lazily(self) -> None:
+        renderer = _CustomPdfRenderer()
+        c = PdfConverter(page_selection="1-2", pdf_renderer=renderer)
+        source = c.open("mobile.pdf", width=8)
+
+        self.assertEqual(source.page_count, 2)
+        self.assertEqual(renderer.documents[0].rendered, [])
+
+        page_iter = iter(source)
+        first = next(page_iter)
+
+        self.assertEqual(first.image.width, 8)
+        self.assertEqual(renderer.documents[0].rendered, [(0, 200 / 72.0)])
+        source.close()
+        self.assertTrue(renderer.documents[0].closed)
+
+    def test_rotate_happens_before_resize_to_print_width(self) -> None:
+        c = PdfConverter(
+            page_selection="1",
+            pdf_renderer=_CustomPdfRenderer(size=(800, 200)),
+            rotation_degrees=90,
+        )
+
+        pages = c.load("mobile.pdf", width=384)
+
+        self.assertEqual(pages[0].image.size, (384, 1536))
+
+    def test_load_pdf_pages_raises_when_no_pages(self) -> None:
+        fake = types.ModuleType("pypdfium2")
+        class _EmptyDoc(_FakePdfDocument):
+            def __init__(self, _path: str):
+                self._pages = []
+                self.closed = False
+        fake.PdfDocument = _EmptyDoc
+        with patch.dict(sys.modules, {"pypdfium2": fake}):
+            c = PdfConverter()
+            with self.assertRaises(RuntimeError):
+                c.load("dummy.pdf", width=8)
+
+
+if __name__ == "__main__":
+    unittest.main()

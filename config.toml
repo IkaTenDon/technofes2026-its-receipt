@@ -1,0 +1,46 @@
+# 変更後はアプリを再起動してください。文言・QR・幅は仮設定です。
+[app]
+test_mode = true  # 本番印刷を有効にする場合だけ false に変更
+database_path = "data/receipts.sqlite3"  # 本番では同じDBを継続使用
+photo_key = "F1"
+no_photo_key = "F2"
+debounce_ms = 1000  # 処理終了から次の操作を受理するまでの最小間隔
+image_retention_seconds = 120  # 処理終了後の再印刷用画像のRAM保持秒数
+
+[receipt]
+width_px = 384  # 暫定。57 mmから確定した値ではない。実機・機種設定と照合
+margin_px = 16
+gap_px = 12
+title = "ご来場ありがとうございます"
+# 未確定: 下記body / footer / qr_dataをイベントの実際の内容に変更
+body = "【変更してください】イベントのご案内をここに記載します。"
+footer = "【仮の内容】QRコードのリンク先は未設定です。"
+qr_data = "https://example.com/"
+font_path = "C:/Windows/Fonts/meiryo.ttc"  # フォントは同梱しない
+font_index = 0
+title_size = 26
+body_size = 20
+number_size = 30
+line_spacing_px = 5
+qr_max_px = 280
+qr_min_module_px = 4  # QRの1モジュールの最小ドット数。白余白は4モジュール
+photo_height_px = 260
+photo_contrast = 1.25
+photo_gamma = 1.0
+
+[camera]
+device_index = 0
+width = 1280  # ドライバーへの希望値。実際の解像度は異なる場合あり
+height = 720
+warmup_frames = 5
+backend = "dshow"  # dshow / msmf / any
+
+[printer]
+source_dir = "vendor/TiMini-Print"
+bluetooth_target = ""  # 必須: 実機のBluetooth名またはアドレスを設定
+model_key = ""  # 自動判定不可時だけTiMiniの既知model keyを指定
+paper_preset = ""  # 空なら機種の既定。可変長ロール紙のみ対応
+blackening = 3  # TiMiniの1〜5。実機で写真・QRを確認して調整
+feed_padding = 12  # 機種固有単位。mmではない
+operation_timeout_s = 10.0
+total_timeout_s = 180.0  # cancellationの後処理により超過する場合あり

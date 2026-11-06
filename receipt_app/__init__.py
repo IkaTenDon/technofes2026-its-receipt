@@ -1,0 +1,1 @@
+"""Offline event receipt kiosk."""

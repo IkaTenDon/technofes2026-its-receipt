@@ -1,0 +1,367 @@
+from __future__ import annotations
+
+import argparse
+import json
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+if str(REPO_ROOT) not in __import__("sys").path:
+    __import__("sys").path.insert(0, str(REPO_ROOT))
+
+from timiniprint.devices import PrinterCatalog  # noqa: E402
+from timiniprint.devices.model_codec import model_from_json  # noqa: E402
+from timiniprint.devices.profiles import (  # noqa: E402
+    PrinterProfile,
+    PrinterModel,
+)
+
+
+def _sample_names(model: dict[str, Any]) -> list[str]:
+    samples: list[str] = []
+    for detection in model.get("detections", []):
+        if detection.get("all_of"):
+            prefixes = [str(value) for value in detection.get("prefixes", [])]
+            substrings = [str(value) for value in detection.get("substrings", [])]
+            exact_names = [str(value) for value in detection.get("exact_names", [])]
+            bases = exact_names or prefixes or [""]
+            for base in bases:
+                sample = base
+                for substring in substrings:
+                    if substring not in sample:
+                        sample += substring
+                suffixes = detection.get("suffixes", [])
+                if suffixes:
+                    samples.extend(
+                        sample if sample.endswith(str(suffix)) else sample + str(suffix)
+                        for suffix in suffixes
+                    )
+                else:
+                    samples.append(sample)
+            continue
+        for name in detection.get("exact_names", []):
+            samples.append(str(name))
+        for prefix in detection.get("prefixes", []):
+            prefix = str(prefix)
+            if prefix.endswith(("-", "_")):
+                samples.append(prefix + "ABCD")
+            else:
+                samples.append(prefix)
+                if "-" not in prefix:
+                    samples.append(prefix + "-ABCD")
+        for substring in detection.get("substrings", []):
+            samples.append(str(substring))
+        for suffix in detection.get("suffixes", []):
+            samples.append("Printer" + str(suffix))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for sample in samples:
+        if sample in seen:
+            continue
+        seen.add(sample)
+        deduped.append(sample)
+    return deduped
+
+
+def _sample_addresses(model: dict[str, Any]) -> list[str | None]:
+    prefixes = [
+        str(value).upper().replace(":", "").replace("-", "")
+        for detection in model.get("detections", [])
+        for value in detection.get("mac_prefixes", [])
+    ]
+    suffixes = [
+        str(value).upper()
+        for detection in model.get("detections", [])
+        for value in detection.get("mac_suffixes", [])
+    ]
+    if prefixes or suffixes:
+        prefix = prefixes[0] if prefixes else "AABB"
+        suffix = suffixes[0] if suffixes else "00"
+        address = (prefix + "000000000000")[:12 - len(suffix)] + suffix
+        return [":".join(address[index:index + 2] for index in range(0, 12, 2))]
+    return [None, "AA:BB:CC:DD:EE:00"]
+
+
+def _sample_manufacturer_data(model: dict[str, Any]) -> list[tuple[bytes, ...]]:
+    samples: list[tuple[bytes, ...]] = [()]
+    for detection in model.get("detections", []):
+        for suffix in detection.get("manufacturer_data_suffixes", []):
+            tail = bytes.fromhex(suffix)
+            for length in detection.get("manufacturer_data_lengths") or [len(tail)]:
+                if length >= len(tail):
+                    samples.append((bytes(length - len(tail)) + tail,))
+    return samples
+
+
+def _mergeable_detection_objects(model: dict[str, Any]) -> list[dict[str, Any]]:
+    repeated: list[dict[str, Any]] = []
+    first_index_by_group: dict[tuple[object, ...], int] = {}
+    for index, detection in enumerate(model.get("detections", [])):
+        # Unioning conjunctions (or mixing them with OR rules) changes which
+        # combinations of name triggers match.
+        if detection.get("all_of"):
+            continue
+        group = (
+            tuple(
+                str(value).strip().casefold()
+                for value in detection.get("excluded_prefixes", [])
+            ),
+            tuple(
+                sorted(
+                    str(value).strip().upper()
+                    for value in detection.get("mac_prefixes", [])
+                )
+            ),
+            tuple(
+                sorted(
+                    str(value).strip().upper()
+                    for value in detection.get("mac_suffixes", [])
+                )
+            ),
+            tuple(
+                sorted(
+                    str(value).strip().upper()
+                    for value in detection.get("excluded_mac_suffixes", [])
+                )
+            ),
+            tuple(
+                str(value).strip().casefold()
+                for value in detection.get("marketing_names", [])
+            ),
+            tuple(sorted(value.upper() for value in detection.get("manufacturer_data_suffixes", []))),
+            tuple(sorted(detection.get("manufacturer_data_lengths", []))),
+            detection.get("name_pattern"),
+        )
+        first_index = first_index_by_group.setdefault(group, index)
+        if first_index != index:
+            repeated.append(
+                {
+                    "kind": "mergeable_detection_objects",
+                    "model_key": model["model_key"],
+                    "detection_indexes": [first_index, index],
+                }
+            )
+    return repeated
+
+
+def _find_model_reachability_error(catalog: PrinterCatalog, model: dict[str, Any]) -> dict[str, Any] | None:
+    if not model.get("detections"):
+        # Manual-only entries are validated by the catalog and have no BT match.
+        return None
+    samples = _sample_names(model)
+    addresses = _sample_addresses(model)
+    blocking: dict[str, Any] | None = None
+    probes = [(address, data) for address in addresses for data in _sample_manufacturer_data(model)]
+    for sample in samples:
+        for address, data in probes:
+            matches = catalog.detect_model(sample, address=address, manufacturer_data=data)
+            if len(matches) > 1:
+                if model["model_key"] in {candidate.model.model_key for candidate in matches}:
+                    matched_origins = next(candidate.origin_ids for candidate in matches
+                                           if candidate.model.model_key == model["model_key"])
+                    for candidate in matches:
+                        candidate_origins = set(candidate.origin_ids)
+                        if (
+                            candidate.model.model_key != model["model_key"]
+                            and set(matched_origins).intersection(candidate_origins)
+                        ):
+                            return {
+                                "kind": "ambiguous_model",
+                                "model_key": model["model_key"],
+                                "sample_name": sample,
+                                "sample_address": address,
+                                "candidate_model_keys": [
+                                    candidate.model.model_key for candidate in matches
+                                ],
+                            }
+                    return None
+                continue
+            match = matches[0] if matches else None
+            if match is None:
+                continue
+            if match.model.model_key == model["model_key"]:
+                return None
+            if blocking is None:
+                blocking = {
+                    "kind": "shadowed_model",
+                    "model_key": model["model_key"],
+                    "sample_name": sample,
+                    "sample_address": address,
+                    "blocked_by_model_key": match.model.model_key,
+                    "expected_profile_key": model["profile_key"],
+                    "expected_protocol_family": (model.get("protocol_override") or {}).get("type"),
+                    "actual_profile_key": match.profile.profile_key,
+                    "actual_protocol_family": match.profile.protocol_default.type.value,
+                }
+    return blocking or {
+        "kind": "unreachable_model",
+        "model_key": model["model_key"],
+        "sample_names": samples[:5],
+        "sample_addresses": addresses,
+    }
+
+def _model_merge_key(model: dict[str, Any]) -> str:
+    """Merge only recipes with the same source attribution for their names."""
+    return json.dumps(
+        {
+            key: sorted(value) if key == "origin_ids" else value
+            for key, value in model.items()
+            if key not in {"model_key", "marketing_names", "detections"}
+        },
+        sort_keys=True,
+    )
+
+
+def generate_report(
+    profile_path: Path | None = None,
+    model_path: Path | None = None,
+) -> dict[str, Any]:
+    default_profile_path = REPO_ROOT / "timiniprint/data/printer_profiles.json"
+    default_model_path = REPO_ROOT / "timiniprint/data/printer_models.json"
+    profile_path = profile_path or default_profile_path
+    model_path = model_path or default_model_path
+    profiles_raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    models_raw = json.loads(model_path.read_text(encoding="utf-8"))
+    if (
+        profile_path == default_profile_path
+        and model_path == default_model_path
+    ):
+        catalog = PrinterCatalog.load(
+            profile_path=profile_path,
+            model_path=model_path,
+        )
+    else:
+        catalog = PrinterCatalog(
+            [model_from_json(PrinterProfile, entry) for entry in profiles_raw],
+            [model_from_json(PrinterModel, entry) for entry in models_raw],
+        )
+
+    referenced_profiles = {model["profile_key"] for model in models_raw}
+    all_profiles = {profile["profile_key"] for profile in profiles_raw}
+
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    for model in models_raw:
+        errors.extend(_mergeable_detection_objects(model))
+
+    for model in models_raw:
+        for detection in model.get("detections", []):
+            for field in (
+                "prefixes",
+                "exact_names",
+                "substrings",
+                "suffixes",
+                "excluded_prefixes",
+            ):
+                for trigger in detection.get(field, []):
+                    if trigger != trigger.strip():
+                        errors.append(
+                            {
+                                "kind": "trigger_whitespace",
+                                "model_key": model["model_key"],
+                                "marketing_names": detection.get("marketing_names", []),
+                                "field": field,
+                                "trigger": trigger,
+                            }
+                        )
+
+    for model in models_raw:
+        if model["profile_key"] not in all_profiles:
+            errors.append(
+                {
+                    "kind": "unknown_profile_reference",
+                    "model_key": model["model_key"],
+                    "profile_key": model["profile_key"],
+                }
+            )
+
+    for model in models_raw:
+        reachability_error = _find_model_reachability_error(catalog, model)
+        if reachability_error is not None:
+            errors.append(reachability_error)
+
+    for profile_key in sorted(all_profiles - referenced_profiles):
+        errors.append(
+            {
+                "kind": "unreferenced_profile",
+                "profile_key": profile_key,
+            }
+        )
+
+    duplicate_profiles: dict[str, list[str]] = defaultdict(list)
+    for profile in profiles_raw:
+        profile_key = profile["profile_key"]
+        canonical_body = json.dumps({k: v for k, v in profile.items() if k != "profile_key"}, sort_keys=True)
+        duplicate_profiles[canonical_body].append(profile_key)
+    for keys in sorted(duplicate_profiles.values()):
+        if len(keys) > 1:
+            errors.append(
+                {
+                    "kind": "duplicate_profile_body",
+                    "profile_keys": keys,
+                }
+            )
+
+    duplicate_models: dict[str, list[str]] = defaultdict(list)
+    mergeable_models: dict[str, list[str]] = defaultdict(list)
+    for model in models_raw:
+        canonical_body = json.dumps({k: v for k, v in model.items() if k != "model_key"}, sort_keys=True)
+        duplicate_models[canonical_body].append(model["model_key"])
+        mergeable_models[_model_merge_key(model)].append(model["model_key"])
+    for keys in sorted(duplicate_models.values()):
+        if len(keys) > 1:
+            errors.append(
+                {
+                    "kind": "duplicate_model_body",
+                    "model_keys": keys,
+                }
+            )
+    for keys in sorted(mergeable_models.values()):
+        if len(keys) > 1:
+            warnings.append(
+                {
+                    "kind": "mergeable_model_body",
+                    "model_keys": keys,
+                }
+            )
+
+    return {
+        "summary": {
+            "profiles": len(catalog.profiles),
+            "models": len(catalog.models),
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+        },
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Audit printer profiles and models for dead or malformed data.")
+    parser.add_argument("--out", help="Write the full audit report as JSON to this path.")
+    args = parser.parse_args()
+
+    report = generate_report()
+    if args.out:
+        Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    print(
+        "Catalog audit: "
+        f"{report['summary']['profiles']} profiles, "
+        f"{report['summary']['models']} models, "
+        f"{report['summary']['error_count']} errors, "
+        f"{report['summary']['warning_count']} warnings"
+    )
+    for entry in report["errors"]:
+        print(f"ERROR {entry['kind']}: {json.dumps(entry, sort_keys=True)}")
+    for entry in report["warnings"]:
+        print(f"WARNING {entry['kind']}: {json.dumps(entry, sort_keys=True)}")
+    return 1 if report["errors"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

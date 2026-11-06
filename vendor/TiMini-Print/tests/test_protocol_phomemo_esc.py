@@ -1,0 +1,305 @@
+from __future__ import annotations
+
+import unittest
+
+from tests.helpers import catalog_for_sources
+
+from timiniprint.devices import PrinterCatalog
+from timiniprint.protocol import PageFlow, PaperMode, PrinterProtocol
+from timiniprint.protocol.family import ProtocolFamily
+from timiniprint.protocol.types import ImageEncoding
+from timiniprint.raster import PixelFormat, RasterBuffer, RasterSet
+
+
+class PhomemoEscProtocolTests(unittest.TestCase):
+    def test_m02_profile_builds_raster_job(self) -> None:
+        device = PrinterCatalog.load().device_from_profile("phomemo_m02")
+        raster = RasterBuffer(
+            pixels=[
+                1, 0, 0, 0, 0, 0, 0, 0,
+                0, 1, 0, 0, 0, 0, 0, 0,
+            ],
+            width=8,
+            pixel_format=PixelFormat.BW1,
+        )
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=False,
+            blackening=3,
+        )
+
+        self.assertEqual(
+            job.payload,
+            b"".join(
+                (
+                    b"\x1b\x40",
+                    b"\x1f\x11\x02\x02",
+                    b"\x1f\x11\x37\x64",
+                    b"\x1f\x11\x0b\x1f\x11\x35\x00",
+                    b"\x1d\x76\x30\x00\x01\x00\x06\x00\x00\x00\x00\x00\x80\x40",
+                    b"\x1b\x64\x02" * 2,
+                )
+            ),
+        )
+
+    def test_m02_continuous_chunk_omits_intermediate_feed(self) -> None:
+        device = PrinterCatalog.load().device_from_profile("phomemo_m02")
+        raster = RasterBuffer(pixels=[0] * 8, width=8, pixel_format=PixelFormat.BW1)
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=True,
+            page_index=1,
+            page_count=2,
+            page_flow=PageFlow.CONTINUOUS,
+        )
+
+        self.assertNotIn(b"\x1b\x64", job.payload)
+
+    def test_m02_uses_16_bit_raster_height(self) -> None:
+        device = PrinterCatalog.load().device_from_profile("phomemo_m02")
+        raster = RasterBuffer(pixels=[0] * (8 * 256), width=8, pixel_format=PixelFormat.BW1)
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=False,
+        )
+
+        self.assertEqual(job.payload.count(b"\x1d\x76\x30\x00"), 1)
+        self.assertIn(b"\x1d\x76\x30\x00\x01\x00\x04\x01", job.payload)
+
+    def test_t02_uses_shared_compact_finish(self) -> None:
+        device = PrinterCatalog.load().device_from_profile("phomemo_t02")
+        raster = RasterBuffer(pixels=[0] * 8, width=8, pixel_format=PixelFormat.BW1)
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=False,
+        )
+
+        self.assertEqual(device.protocol_family, ProtocolFamily.PHOMEMO_ESC)
+        self.assertEqual(device.protocol_variant, "t02")
+        self.assertIn(b"\x1d\x76\x30\x00\x01\x00\x05\x00\x00\x00\x00\x00\x00", job.payload)
+        self.assertTrue(job.payload.endswith(b"\x1b\x64\x02" * 2))
+
+    def test_m02_pro_profile_builds_300dpi_raster_job(self) -> None:
+        device = PrinterCatalog.load().device_from_profile("phomemo_m02_pro")
+        raster = RasterBuffer(pixels=[0] * 576, width=576, pixel_format=PixelFormat.BW1)
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=False,
+        )
+
+        self.assertEqual(device.profile.default_paper_preset.paper_width_px, 576)
+        self.assertEqual(device.profile.dev_dpi, 300)
+        self.assertEqual(device.protocol_variant, "m02_pro")
+        self.assertIn(b"\x1d\x76\x30\x00\x48\x00\x05\x00", job.payload)
+        self.assertTrue(job.payload.endswith(b"\x1b\x64\x02" * 2))
+
+    def test_m02x_profile_builds_m02_family_raster_job(self) -> None:
+        device = PrinterCatalog.load().device_from_profile("phomemo_m02x")
+        raster = RasterBuffer(pixels=[0] * 384, width=384, pixel_format=PixelFormat.BW1)
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=False,
+        )
+
+        self.assertEqual(device.profile.default_paper_preset.paper_width_px, 384)
+        self.assertEqual(device.profile.dev_dpi, 203)
+        self.assertEqual(device.protocol_variant, "m02x")
+        self.assertIn(b"\x1d\x76\x30\x00\x30\x00\x05\x00", job.payload)
+        self.assertTrue(job.payload.endswith(b"\x1b\x64\x02"))
+
+    def test_printmaster_m110_profile_builds_raw_m110_style_raster_job(self) -> None:
+        device = PrinterCatalog.load().device_from_model("printmaster_m110")
+        raster = RasterBuffer(
+            pixels=[
+                1, 0, 0, 0, 0, 0, 0, 0,
+                *([0] * 376),
+                0, 1, 0, 0, 0, 0, 0, 0,
+                *([0] * 376),
+            ],
+            width=384,
+            pixel_format=PixelFormat.BW1,
+        )
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=False,
+            blackening=3,
+        )
+
+        padded_rows = bytes([0x80] + [0] * 47 + [0x40] + [0] * 47)
+        self.assertEqual(
+            job.payload,
+            b"".join(
+                (
+                    b"\x1b\x40",
+                    b"\x1d\x76\x30\x00\x30\x00\x02\x00",
+                    padded_rows,
+                )
+            ),
+        )
+
+    def test_printmaster_m120_profile_adds_print_multi_before_raster(self) -> None:
+        device = PrinterCatalog.load().device_from_model("printmaster_m120")
+        raster = RasterBuffer(
+            pixels=[
+                1, 0, 0, 0, 0, 0, 0, 0,
+                *([0] * 376),
+                0, 1, 0, 0, 0, 0, 0, 0,
+                *([0] * 376),
+            ],
+            width=384,
+            pixel_format=PixelFormat.BW1,
+        )
+
+        job = PrinterProtocol(device).build_job(
+            RasterSet.from_single(raster),
+            is_text=False,
+        )
+
+        padded_rows = bytes([0x80] + [0] * 47 + [0x40] + [0] * 47)
+        self.assertEqual(
+            job.payload,
+            b"".join(
+                (
+                    b"\x1b\x40",
+                    b"\x1f\x11\x21\x01",
+                    b"\x1d\x76\x30\x00\x30\x00\x02\x00",
+                    padded_rows,
+                )
+            ),
+        )
+
+    def test_printmaster_m110_requires_full_width_until_margin_flow_is_modelled(self) -> None:
+        device = PrinterCatalog.load().device_from_model("printmaster_m110")
+        raster = RasterBuffer(
+            pixels=[0] * 8,
+            width=8,
+            pixel_format=PixelFormat.BW1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "384px raster width"):
+            PrinterProtocol(device).build_job(
+                RasterSet.from_single(raster),
+                is_text=False,
+            )
+
+    def test_m02_detection_does_not_steal_m02s(self) -> None:
+        catalog = PrinterCatalog.load()
+
+        m02 = catalog.detect_device("Mr.in_M02")
+        m02s = catalog.detect_device("M02S")
+        m02s_alias = catalog.detect_device("Mr.in_M02S")
+
+        self.assertIsNotNone(m02)
+        self.assertIsNotNone(m02s)
+        self.assertIsNotNone(m02s_alias)
+        assert m02 is not None
+        assert m02s is not None
+        assert m02s_alias is not None
+        self.assertEqual(m02.profile_key, "phomemo_m02")
+        self.assertEqual(m02.protocol_family, ProtocolFamily.PHOMEMO_ESC)
+        self.assertEqual(m02.protocol_variant, "m02")
+        self.assertEqual(m02.image_pipeline.encoding, ImageEncoding.PHOMEMO_ESC_RASTER)
+        self.assertEqual(m02s.profile_key, "phomemo_m02s")
+        self.assertEqual(m02s.protocol_variant, "m02s")
+        self.assertEqual(m02s_alias.profile_key, "phomemo_m02s")
+
+    def test_m02x_detection_does_not_steal_m02_or_m02_pro(self) -> None:
+        catalog = PrinterCatalog.load()
+
+        for name in ("M02X", "m02x"):
+            with self.subTest(name=name):
+                device = catalog.detect_device(name)
+                self.assertIsNotNone(device)
+                assert device is not None
+                self.assertEqual(device.profile_key, "phomemo_m02x")
+                self.assertEqual(device.protocol_variant, "m02x")
+
+        self.assertIsNone(catalog.detect_device("M02X-ABCD"))
+        self.assertIsNone(catalog.detect_device("m02x_abcd"))
+
+        m02 = catalog.detect_device("M02")
+        m02_pro = catalog.detect_device("M02 Pro")
+        self.assertIsNotNone(m02)
+        self.assertIsNotNone(m02_pro)
+        assert m02 is not None
+        assert m02_pro is not None
+        self.assertEqual(m02.profile_key, "phomemo_m02")
+        self.assertEqual(m02_pro.profile_key, "phomemo_m02_pro")
+
+    def test_m02_pro_detection_does_not_steal_m02(self) -> None:
+        catalog = PrinterCatalog.load()
+
+        for name in ("M02 Pro", "M02PRO", "m02pro"):
+            with self.subTest(name=name):
+                device = catalog.detect_device(name)
+                self.assertIsNotNone(device)
+                assert device is not None
+                self.assertEqual(device.profile_key, "phomemo_m02_pro")
+                self.assertEqual(device.protocol_variant, "m02_pro")
+
+        self.assertIsNone(catalog.detect_device("M02 PRO-ABCD"))
+        self.assertIsNone(catalog.detect_device("m02pro_abcd"))
+
+        m02 = catalog.detect_device("M02")
+        self.assertIsNotNone(m02)
+        assert m02 is not None
+        self.assertEqual(m02.profile_key, "phomemo_m02")
+
+    def test_t02_detection_does_not_steal_other_02_models(self) -> None:
+        catalog = PrinterCatalog.load()
+
+        self.assertEqual(catalog.detect_device("T02").model_key, "phomemo_t02")
+        self.assertEqual(
+            {match.model.model_key for match in catalog.detect_model("T02")},
+            {"phomemo_t02"},
+        )
+
+        for name in ("T02E", "C02E"):
+            with self.subTest(name=name):
+                device = catalog.detect_device(name)
+                self.assertIsNotNone(device)
+                assert device is not None
+                self.assertEqual(device.profile_key, "phomemo_t02")
+                self.assertEqual(device.protocol_variant, "t02")
+
+        self.assertIsNone(catalog.detect_device("T02-ABCD"))
+        self.assertIsNone(catalog.detect_device("T02E-ABCD"))
+        self.assertIsNone(catalog.detect_device("C02E_1234"))
+        self.assertNotEqual(catalog.detect_device("GT02-ABCD").profile_key, "phomemo_t02")
+        self.assertNotEqual(catalog.detect_device("YT02").profile_key, "phomemo_t02")
+
+    def test_printmaster_redirects_do_not_create_phomemo_protocol_variants(self) -> None:
+        catalog = PrinterCatalog.load()
+        printmaster = catalog_for_sources("com.project.aimotech.printmaster")
+        for name, key in (("M110", "printmaster_m110"), ("M120", "printmaster_m120")):
+            self.assertEqual(printmaster.detect_device(name).model_key, key)
+        for name in ("M110-ABCD", "M120ABCD", "M220", "M220-ABCD"):
+            self.assertFalse(any(
+                "com.quyin.phomemo" in match.origin_ids for match in catalog.detect_model(name)
+            ))
+
+    def test_m02_supports_plain_paper_mode_and_motion(self) -> None:
+        device = PrinterCatalog.load().device_from_profile("phomemo_m02")
+        protocol = PrinterProtocol(device)
+
+        self.assertEqual(protocol.supported_paper_modes(), (PaperMode.PLAIN, PaperMode.TAG))
+        self.assertEqual(protocol.build_paper_motion("feed").payload, b"\x1b\x4a\x50")
+        self.assertEqual(protocol.build_paper_motion("retract").payload, b"")
+
+    def test_printmaster_m110_exposes_fixed_paper_mode(self) -> None:
+        catalog = PrinterCatalog.load()
+        for model_key in ("printmaster_m110", "printmaster_m120"):
+            with self.subTest(model_key=model_key):
+                protocol = PrinterProtocol(catalog.device_from_model(model_key))
+                self.assertEqual(protocol.supported_paper_modes(), (PaperMode.TAG,))
+
+
+if __name__ == "__main__":
+    unittest.main()

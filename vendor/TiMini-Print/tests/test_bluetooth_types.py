@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+import unittest
+
+from timiniprint.devices import get_ble_transport_profile
+from timiniprint.protocol.family import ProtocolFamily
+from timiniprint.transport.bluetooth.types import DeviceInfo, DeviceTransport
+
+
+class BluetoothTypesTests(unittest.TestCase):
+    def test_merge_validates_key(self) -> None:
+        a = DeviceInfo("X", "AA", transport=DeviceTransport.CLASSIC)
+        b = DeviceInfo("X", "BB", transport=DeviceTransport.CLASSIC)
+        with self.assertRaises(ValueError):
+            a.merge(b)
+
+    def test_merge_name_and_paired_rules(self) -> None:
+        a = DeviceInfo("A", "AA", paired=False, transport=DeviceTransport.CLASSIC)
+        b = DeviceInfo("Longer", "AA", paired=True, transport=DeviceTransport.CLASSIC)
+        c = a.merge(b)
+        self.assertEqual(c.name, "Longer")
+        self.assertTrue(c.paired)
+
+    def test_merge_preserves_ble_mtu_request(self) -> None:
+        a = DeviceInfo("A", "AA", transport=DeviceTransport.BLE)
+        b = DeviceInfo("Longer", "AA", transport=DeviceTransport.BLE, ble_mtu_request=512)
+        c = a.merge(b)
+        self.assertEqual(c.ble_mtu_request, 512)
+
+    def test_merge_preserves_ble_profile(self) -> None:
+        profile = get_ble_transport_profile(ProtocolFamily.V5X)
+        a = DeviceInfo("A", "AA", transport=DeviceTransport.BLE)
+        b = DeviceInfo("Longer", "AA", transport=DeviceTransport.BLE, ble_profile=profile)
+
+        self.assertIs(a.merge(b).ble_profile, profile)
+
+    def test_rejects_invalid_ble_mtu_request(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ble_mtu_request"):
+            DeviceInfo("A", "AA", transport=DeviceTransport.BLE, ble_mtu_request=22)
+
+    def test_dedupe_by_address_and_transport(self) -> None:
+        d = [
+            DeviceInfo("A", "AA", transport=DeviceTransport.CLASSIC),
+            DeviceInfo("B", "AA", transport=DeviceTransport.CLASSIC),
+            DeviceInfo("C", "AA", transport=DeviceTransport.BLE),
+        ]
+        out = DeviceInfo.dedupe(d)
+        self.assertEqual(len(out), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

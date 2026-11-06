@@ -1,0 +1,201 @@
+# TiMini Print Community
+Alternative open-source [desktop software](https://github.com/Dejniel/TiMini-Print/releases) and an expanded commercial [TiMini Print mobile app at timiniprint.com](https://timiniprint.com/) for Chinese Bluetooth thermal printers that use proprietary protocols (not ESC/POS), as a replacement for apps like “Tiny Print”, “Fun Print”, “Funny Print”, “Dolewa”, “iBleem”, “Luck Jingle”, “Phomemo”, “Print Master”, “InstaPrint”, “ToPrint”, “Eleph-label”, or “NIIMBOT”, with additional “Marklife”, “Guguji”, “Memobird”, “Youdao”, “Snap & Tag”, “WalkPrint” and “Paperang” support in the [commercial app](https://timiniprint.com/).
+It supports almost all mini printers! Check the huge list of [supported Bluetooth printer models](#supported-printer-models), or report missing ones.
+TiMini Print lets you print images, PDFs, or plain text from your computer. It supports both a GUI and a “fire-and-forget” CLI mode, plus [custom integrations](#library-integration)
+
+These printers are often sold on AliExpress and under generic names such as “thermal printer”, “mini printer”, or “cat printer”.
+TiMini Print Community works on Windows, Linux, and macOS as a standalone tool without a system printer driver (it does not emulate a driver or print spooler). The [TiMini Print mobile app](https://timiniprint.com/) is available for Android (and soon iOS).
+Unlike similar projects, TiMini Print models printer behavior to match the original apps as closely as possible, down to the packet level
+
+## Motivation
+I bought a Chinese mini printer and could not find any decent desktop software that met my expectations, so I wrote my own. This is also the kind of work I do professionally. If you need help with a similar problem, you can [contact me](https://inajiffy.eu/) — I can also help with [broader support or custom implementation](#looking-for-broader-support-or-implementation)
+
+![TiMini Print LOGO EMX-040256 Printer Psi Patrol](EMX_040256.jpg)
+
+# We need you!
+- This project is open source! Even a small monthly contribution on [Buy Me a Coffee](https://buymeacoffee.com/dejniel) helps keep TiMini Print Community going.
+- If you're a developer, [contributions](#contributing) and bug reports are always welcome. Especially if you use or build on non-Linux systems, please consider contributing fixes or improvements.
+
+## Looking for broader support or implementation?
+- If you need security/reverse engineering, broader commercial support, or a custom implementation, feel free to [reach out at inajiffy.eu](https://inajiffy.eu/). I work on broken systems, neglected integrations, and projects that are already end-of-life, unsupported — or simply unsupportable. I also handle custom implementation work that sits outside the usual support model.
+- Also check out the expanded commercial [TiMini Print mobile app at timiniprint.com](https://timiniprint.com/).
+
+# Download
+- **TiMini Print Community:** Download the free and open-source desktop GUI or CLI for Windows, Linux, and macOS from the [releases page](https://github.com/Dejniel/TiMini-Print/releases), or build it yourself using the instructions below
+- **TiMini Print mobile app:** Offers a larger printer catalog while keeping printing offline. Get it from [timiniprint.com](https://timiniprint.com/) or directly from the [Google Play Store](https://play.google.com/store/apps/details?id=pl.wtrymiga.timiniprint)
+
+I mainly test TiMini Print on Ubuntu-like systems and Android. Windows and macOS builds are available too, but if something breaks there, please report it or submit a fix :P
+
+## Build from source
+- Python 3.8+
+- `pip install -r requirements.txt`
+  - Windows + Python 3.13+: installing `winsdk` may require building binaries during download
+  - (optional, GUI only) if `tkinter` is missing, install it from your system packages:
+  Linux (Ubuntu/Debian): `sudo apt install python3-tk`
+  macOS (Homebrew Python): `brew install python-tk`
+
+# Quick start
+If you use release binaries, run the downloaded executable directly.
+If you build or run from source instead, use `python3 timiniprint_gui.py` or `python3 timiniprint_command_line.py`.
+
+## Graphical user interface
+You can scan, connect or disconnect with one button, choose a file, and print.
+Start the graphical app by running the [downloaded executable file](#download).
+On Linux, make sure it has execute permission first.
+
+```bash
+# Replace the filename below with the matching asset for your platform
+chmod +x ./TiMini-Print-GUI-Linux-x86_64
+./TiMini-Print-GUI-Linux-x86_64
+```
+
+Or run it from source:
+
+```bash
+python3 timiniprint_gui.py
+```
+
+## Command line interface
+(the examples use Linux filenames)
+- Print to the first supported Bluetooth printer:
+  ```bash
+  ./TiMini-Print-Command-Line-Linux-x86_64 /path/to/file.pdf
+  ```
+
+- Print to a specific Bluetooth printer:
+  ```bash
+  ./TiMini-Print-Command-Line-Linux-x86_64 --bluetooth "PRINTER_NAME" /path/to/file.pdf
+  ```
+
+- Print via a serial port (skip Bluetooth connection):
+  ```bash
+  ./TiMini-Print-Command-Line-Linux-x86_64 --export-printer-config luck_a2 printer.json
+  ./TiMini-Print-Command-Line-Linux-x86_64 --serial /dev/rfcomm0 --printer-config printer.json /path/to/file.pdf
+  ```
+
+- Force a specific model for an unsupported or random Bluetooth name:
+  ```bash
+  ./TiMini-Print-Command-Line-Linux-x86_64 --list-models
+  ./TiMini-Print-Command-Line-Linux-x86_64 --printer-model luck_a2 /path/to/file.pdf
+  ```
+
+- Print raw text without creating a file:
+  ```bash
+  ./TiMini-Print-Command-Line-Linux-x86_64 --text "Hello from CLI"
+  ```
+
+- List available printer models:
+  ```bash
+  ./TiMini-Print-Command-Line-Linux-x86_64 --list-models
+  ```
+
+- Scan for supported printers:
+  ```bash
+  ./TiMini-Print-Command-Line-Linux-x86_64 --scan
+  ```
+
+## Notes
+- If `--bluetooth`, `--printer-model`, and `--printer-config` are omitted, the first supported printer found is used
+- With `--printer-model` or `--printer-config`, `--bluetooth` is optional; without it, the first Bluetooth target found is used unless the printer config has a saved Bluetooth target
+- Use `--bluetooth NAME_OR_ADDRESS` when several Bluetooth devices are nearby and you want to choose one explicitly
+- For `--serial`, you must pass `--printer-model MODEL_KEY` or `--printer-config printer.json`
+- `--printer-model KEY` uses a known model key directly; `--printer-config PATH` loads an editable printer config JSON
+- `--export-printer-config KEY PATH` writes a full editable printer config JSON from a known model key or public model name
+- The GUI and standalone CLI release builds check GitHub releases at startup at most once per day. To disable this, set `enabled = false` in the `[update]` section of the per-user `settings.ini`, or set `TIMINIPRINT_NO_UPDATE_CHECK=1` in the environment
+
+# Notes
+- On first Classic connection on Windows/macOS, the system may request pairing confirmation
+
+## Library integration
+If you want to build your own integration instead of using only the bundled GUI or CLI, start with [docs/protocol.md](docs/protocol.md). It is the practical first-steps guide to resolving a `PrinterDevice`, connecting it, and printing through `ConnectedPrinter`. For package boundaries, continue with [docs/architecture.md](docs/architecture.md). For model/profile JSON data, read [docs/catalog.md](docs/catalog.md).
+
+# Supported formats
+- Images: .png .jpg .jpeg .gif .bmp
+- PDF: prints all pages
+- Text: .txt (monospace bold, word-wrapped by default)
+
+# Supported printer models
+The list below covers TiMini Print Community. The [TiMini Print mobile app at timiniprint.com](https://timiniprint.com/) supports every Community model plus additional “WalkPrint”, “Paperang”, and other printers.
+
+<!-- BEGIN supported-models -->
+A33, A40, A41III, A43, A4300, AI01, AN01, APA41, APA46Y, APA49H, BH03, D100, D11, D110, D11S, DL_X2, DL_X7, DL_X7Pro, GB01, GB02, GB02SH, GB03SL, GB04, GB05, GT02, GT04, GW09, HD1, HP6-C, JXM800, Label Printer, LP100, LT01, LuckP_A41, LuckP_A42, LY01, LY02, LY03, LY05, LY10, LY11, M2, Mini Printer, MPA81, MX02, MX03, MX07, MX08, MX09, MXW010, P1, P10, P11, P4, P6, P7, PD01, PPA2L, PPA2LH, PR30, PR88, Professional Printer, PT001, QIRUI_Q1, QIRUI_Q2, S01, S101, S102, Shipping Printer, U1, U8, WQ02, X101H, X5, X6, X7, X8, XW001, XW002, YHK, YTB01, ZHHC, ZP802, ZPA4Z1
+
+- 15P3 and clones: YK06
+- 58P5 and clones: WL01
+- A2 and clones: A2_EY48D, A2_LYiN48D_ITSR, PPA2
+- A2H and clones: A2_LYiN48DH, PPA2H
+- A41II and clones: A42II, A200
+- A80H-HD and clones: DP_A80H
+- APA40 and clones: APA42, APA43
+- APL86HL and clones: L86H_Printer, APL86H
+- BH-01 and clones: LX-D01, LX-D02, LX-D2, LX-D3, LX-D4, LX-D5, LX-D6, LX-D7, LX-D8, LX-D9, LX-D03, LX-D04, LX-D05, LX-D06, LX-D07, LX-D08, LX-D09
+- BQ02 and clones: BQ03, BQ17
+- CMT-0510 and clones: SC03, SC04, GV-MA211
+- CTP-500 and clones: CorePrint, Teal Printer, Purple Printer, B Pink Printer, Cherry Printer, Floral Printer, Check Printer, Smiley Printer, Stone Printer, P Pink Printer, YHK
+- D80 and clones: DP_D80, DP-D80, E80, CASA-01, PeriPage_A40, DYD80
+- DL_X2Pro and clones: P5
+- DYA49 and clones: ITP06, DP_ITP06, TPA46Pro
+- DYD80H and clones: DP_D80H
+- E49 and clones: A49, APA49
+- ewtto ET-Z0504 and clones: IM.04, X103H, SC05, X102, X5HP, X6HP, P7H, X2H, X5H, X6H, X7H
+- FL01 and clones: KF-5
+- GB03 and clones: GB06
+- GB03PH and clones: GB03SH
+- GT01 and clones: GT03
+- GT08 and clones: GW08, XW005
+- GT09 and clones: GT10
+- IprintIt and clones: DY01, LP6
+- ITP05H and clones: DYA46, ITP05, DP_ITP05, TPA46, DP_A4, DP-A4, DP_8038
+- JK01 and clones: YT01, YT02
+- JX001 and clones: JX002, JX003, JX004, JX005, JX006
+- L1 and clones: U2
+- L86 and clones: L86_Printer, APL86
+- LGM01 and clones: X7HP
+- M02 and clones: M02C, Mr.in, Mr.in_M02
+- M02 Pro and clones: M02PRO, sandymaro
+- M02S and clones: Mr.in_M02S
+- M02X and clones: M02D, M02E, MR2, M02A, KP-Q1
+- M102 and clones: M120, Q306, Q481, Q485, Q009, Q244, Q451, Q592
+- M108 and clones: M108_Z, M108TA, M109, M105, M110, M110S, M110R, Q042, Q045, Q061, Q062, Q194, Q431, Q437, Q120, Q524, Q593, Q043, Q317, M002, Q002, Q011, Q026, Q034, Q119, Q192, Q468
+- MINIPRINTER and clones: JL-BR22
+- MV-B530 and clones: GL-VS9, QDID, X9
+- MX05 and clones: MX06, MXTP-100, CYLOBTPRINTER, EWTTOET-Z0499
+- MX10 and clones: AZ-P2108X, MXW009, KP-IM606, GV-MA211
+- MX11 and clones: MX12
+- MX13 and clones: XOPOPPY
+- MXW01-1 and clones: KERUI, BQ17
+- Orgstra S001 and clones: S001
+- P2 and clones: P5
+- P5AI and clones: PR07, XW003, XW009, M01, AI01
+- Pocket Printer and clones: Luxorp.PX10, EMX-040256, SeznikEcho, TCM690464, UXPORTMIP, DL_GE225, ML-MP-01, ROSSMANN, 0019B-C, 0019B-D, DTR-R0, GB03PL, HT0125, RT034h, DT1-0, SC03h, SC04h, X103h, DY03, X100, X2h, X5h, X6h, X7h, XC9, D1, X18, DT1-R, TD-11308, XC9-FL01, P1, P2
+- PR02 and clones: XW008
+- PR893 and clones: XW007
+- SC03H and clones: FC02
+- SeznikNeo and clones: RS9000, XiaoWa, JRX01, QDX01, wts07, CP01, DY49, S5A, P20 max, S9A, DY33A, YMS-BT01, WJ-HOT-PRT
+- T02 and clones: T02E, C02E
+- X1 and clones: X2, MXW01, C17, MXW-W5, PORTABLEPRINTER, INSTANTPRINTPLUS, REKA, HDMDT-00, MX01, MX05, MX06, MX08, MX09, MX10, MX11, MX12, MX13, MXTP-100, MXPC-100, AZ-P2108X, PD01, URBANWORXKIDSCAMERA, CYLOBTPRINTER, XOPOPPY, BQ01, EWTTOET-Z0499, BQ05, BQ95B, BQ95C, BQ95, BQ06B, BQ06, BQ07, BQ7A, BQ7B, BQ08, BQ96, MXW009, MXW010, EWTTOET-N3689, EWTTOET-N3687, KP-IM606, GV-MA211, X6, K06, MX02, MX03, MX07, MINIPRINTER, JL-BR22, BQ02, BQ03
+- X16 and clones: Audio Print, A2, A3
+- XW004 and clones: PR35
+- YT01 and clones: YT02, MX01, MXPC-100, URBANWORXKIDSCAMERA, BQ01, BQ05, BQ95B, BQ95C, BQ95, BQ06B, BQ06, BQ07, BQ7A, BQ7B, BQ08, BQ96, EWTTOET-N3689, EWTTOET-N3687, X6, K06
+- ZP801 and clones: XW006, PR89, X8-L, X8-W
+<!-- END supported-models -->
+
+# Unsupported or missing printer?
+
+The commercial [TiMini Print mobile app at timiniprint.com](https://timiniprint.com/#supported-printers) supports a much larger printer catalogue, including “Marklife”, “Guguji”, “Memobird”, “Youdao”, “Snap & Tag”, “WalkPrint”, “Paperang”, and many others.
+
+If your printer is still missing, you can order a custom driver implementation directly in the [mobile app at timiniprint.com](https://timiniprint.com/) or, for broader work, [contact me](#looking-for-broader-support-or-implementation).
+
+You can also request Community support by [opening an issue](https://github.com/Dejniel/TiMini-Print/issues) and support development on [Buy Me a Coffee](https://buymeacoffee.com/dejniel). Many known printers look implementable, but adding them requires more research, hardware reports, testing, or funding.
+
+Can you implement the driver yourself? [Contributions](#contributing) are very welcome.
+
+# Contributing
+
+Found a bug, added a printer, or improved a protocol? Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
+
+Please report security issues privately as described in [SECURITY.md](SECURITY.md).
+
+# License
+
+TiMini-Print is licensed under the [Apache License 2.0](LICENSE). Copyright and attribution information is available in [NOTICE](NOTICE). Run a release binary with `--licenses`, or use the small `Licenses` link in the GUI, to see all bundled third-party notices.

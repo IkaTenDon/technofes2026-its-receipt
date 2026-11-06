@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MODULE_PATH = REPO_ROOT / "tools/catalog_audit.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("catalog_audit", MODULE_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load catalog_audit module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _profile_payload(profile_key: str) -> dict:
+    return {
+        "profile_key": profile_key,
+        "size": 1,
+        "one_length": 8,
+        "dev_dpi": 203,
+        "ble_mtu_request": 23,
+        "has_id": False,
+        "use_spp": False,
+        "can_print_label": False,
+        "label_value": "",
+        "back_paper_num": 0,
+        "protocol_default": {"type": "tiny"},
+        "default_image_pipeline": {"formats": ["bw1"], "encoding": "tiny_raw"},
+        "stream": {"chunk_size": 180, "delay_ms": 4},
+        "post_print_feed_count": 2,
+        "print_defaults": {
+            "speed": {"image": 10, "text": 8},
+            "energy": {
+                "image": {"low": 5000, "middle": 5000, "high": 5000},
+                "text": {"low": 8000, "middle": 8000, "high": 8000},
+            },
+        },
+        "paper_presets": [
+            {
+                "key": "default",
+                "label": "Default",
+                "paper_width_px": 384,
+                "render_width_px": 384,
+            }
+        ],
+    }
+
+
+class CatalogAuditTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tool = _load_module()
+
+    def test_catalog_audit_has_no_errors(self) -> None:
+        report = self.tool.generate_report()
+
+        self.assertEqual(report["errors"], [])
+
+    def test_catalog_audit_has_no_duplicate_findings(self) -> None:
+        report = self.tool.generate_report()
+        duplicate_errors = [
+            error
+            for error in report["errors"]
+            if error["kind"] in {"duplicate_profile_body", "duplicate_model_body"}
+        ]
+        duplicate_warnings = [
+            warning
+            for warning in report["warnings"]
+            if warning["kind"] in {"duplicate_profile_body", "duplicate_model_body"}
+        ]
+
+        self.assertEqual(duplicate_errors, [])
+        self.assertEqual(duplicate_warnings, [])
+
+    def test_catalog_audit_detects_shadowed_model(self) -> None:
+        profiles = [
+            _profile_payload("base"),
+            _profile_payload("specific_profile"),
+        ]
+        models = [
+            {
+                "model_key": "generic",
+                "detections": [{"prefixes": ["FOO"]}],
+                "profile_key": "base",
+                "protocol_override": {"type": "tiny"},
+                "origin_ids": ["com.example.generic"],
+            },
+            {
+                "model_key": "specific",
+                "detections": [{"prefixes": ["FOO"]}],
+                "profile_key": "specific_profile",
+                "protocol_override": {"type": "tiny"},
+                "origin_ids": ["com.example.generic"],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "profiles.json"
+            model_path = Path(tmp) / "models.json"
+            profile_path.write_text(json.dumps(profiles), encoding="utf-8")
+            model_path.write_text(json.dumps(models), encoding="utf-8")
+
+            report = self.tool.generate_report(profile_path=profile_path, model_path=model_path)
+
+        ambiguous = [error for error in report["errors"] if error["kind"] == "ambiguous_model"]
+        self.assertEqual(len(ambiguous), 2)
+        self.assertEqual(
+            {error["model_key"] for error in ambiguous},
+            {"generic", "specific"},
+        )
+
+    def test_manual_only_model_does_not_require_automatic_reachability(self) -> None:
+        profiles = [_profile_payload("manual")]
+        models = [{
+            "model_key": "manual",
+            "profile_key": "manual",
+            "marketing_names": ["Manual device"],
+            "detections": [],
+            "origin_ids": ["com.example.manual"],
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "profiles.json"
+            model_path = Path(tmp) / "models.json"
+            profile_path.write_text(json.dumps(profiles), encoding="utf-8")
+            model_path.write_text(json.dumps(models), encoding="utf-8")
+            report = self.tool.generate_report(profile_path=profile_path, model_path=model_path)
+        self.assertEqual(report["errors"], [])
+
+    def test_mergeable_models_preserve_name_to_source_associations(self) -> None:
+        profiles = [_profile_payload("base")]
+        models = [
+            {
+                "model_key": "first",
+                "detections": [{"prefixes": ["FOO"]}],
+                "profile_key": "base",
+                "protocol_override": {"type": "tiny"},
+                "origin_ids": ["com.example.source"],
+            },
+            {
+                "model_key": "second",
+                "detections": [{"prefixes": ["BAR"]}],
+                "profile_key": "base",
+                "protocol_override": {"type": "tiny"},
+                "origin_ids": ["com.example.other_source"],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "profiles.json"
+            model_path = Path(tmp) / "models.json"
+            profile_path.write_text(json.dumps(profiles), encoding="utf-8")
+            model_path.write_text(json.dumps(models), encoding="utf-8")
+
+            report = self.tool.generate_report(profile_path=profile_path, model_path=model_path)
+
+            self.assertEqual(report["warnings"], [])
+            models[1]["origin_ids"] = models[0]["origin_ids"]
+            model_path.write_text(json.dumps(models), encoding="utf-8")
+            report = self.tool.generate_report(profile_path=profile_path, model_path=model_path)
+
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["warnings"], [
+            {"kind": "mergeable_model_body", "model_keys": ["first", "second"]},
+        ])
+
+    def test_catalog_audit_detects_mergeable_detection_objects(self) -> None:
+        profiles = [_profile_payload("base")]
+        models = [
+            {
+                "model_key": "demo",
+                "detections": [
+                    {"exact_names": ["FOO"]},
+                    {"prefixes": ["BAR"]},
+                    {"prefixes": ["QUX"], "excluded_prefixes": ["QUX Pro"]},
+                    {"prefixes": ["ZIP"], "excluded_prefixes": ["ZIP Max"]},
+                    {"prefixes": ["BAR"], "substrings": ["PRO"], "all_of": True},
+                    {"prefixes": ["BAZ"], "substrings": ["MAX"], "all_of": True},
+                ],
+                "profile_key": "base",
+                "protocol_override": {"type": "tiny"},
+                "origin_ids": ["com.example.source"],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "profiles.json"
+            model_path = Path(tmp) / "models.json"
+            profile_path.write_text(json.dumps(profiles), encoding="utf-8")
+            model_path.write_text(json.dumps(models), encoding="utf-8")
+
+            report = self.tool.generate_report(
+                profile_path=profile_path,
+                model_path=model_path,
+            )
+
+        errors = [
+            error
+            for error in report["errors"]
+            if error["kind"] == "mergeable_detection_objects"
+        ]
+        self.assertEqual(
+            errors,
+            [
+                {
+                    "kind": "mergeable_detection_objects",
+                    "model_key": "demo",
+                    "detection_indexes": [0, 1],
+                }
+            ],
+        )
+
+    def test_catalog_audit_keeps_source_local_conflicts_separate(self) -> None:
+        cases = (
+            [
+                {"model_key": "broad", "profile_key": "base", "origin_ids": ["app.a"],
+                 "detections": [{"prefixes": ["FOO"]}]},
+                {"model_key": "precise", "profile_key": "base", "origin_ids": ["app.b"],
+                 "detections": [{"prefixes": ["FOOB"]}]},
+            ],
+            [
+                {"model_key": "shared", "profile_key": "base", "origin_ids": ["app.a", "app.b"],
+                 "detections": [{"prefixes": ["FOO"]}]},
+                {"model_key": "precise", "profile_key": "base", "origin_ids": ["app.a"],
+                 "detections": [{"exact_names": ["FOO"]}]},
+            ],
+        )
+        for models in cases:
+            with self.subTest(models=[model["model_key"] for model in models]):
+                with tempfile.TemporaryDirectory() as tmp:
+                    profile_path = Path(tmp) / "profiles.json"
+                    model_path = Path(tmp) / "models.json"
+                    profile_path.write_text(json.dumps([_profile_payload("base")]), encoding="utf-8")
+                    model_path.write_text(json.dumps(models), encoding="utf-8")
+                    report = self.tool.generate_report(
+                        profile_path=profile_path,
+                        model_path=model_path,
+                    )
+                self.assertEqual(report["errors"], [])
+
+if __name__ == "__main__":
+    unittest.main()

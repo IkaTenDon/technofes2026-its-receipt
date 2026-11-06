@@ -1,0 +1,65 @@
+"""Shared TSPL command and bitmap encoding."""
+
+from __future__ import annotations
+
+from ...raster import PixelFormat, RasterBuffer
+from ..compression import compress_zlib
+from .bitmap import pack_bw1_rows, packed_row_width_bytes
+
+
+def command(name: str, value: str | None = None, *, line_end: bytes) -> bytes:
+    return command_head(name, value) + line_end
+
+
+def command_head(name: str, value: str | None = None) -> bytes:
+    if value is None:
+        return name.encode("ascii")
+    return f"{name} {value}".encode("ascii")
+
+
+def bitmap_command(
+    raster: RasterBuffer,
+    *,
+    line_end: bytes,
+    invert_bits: bool = False,
+    mode: int = 0,
+    reverse_traversal: bool = False,
+) -> bytes:
+    raster.validate()
+    if raster.pixel_format is not PixelFormat.BW1:
+        raise ValueError("TSPL bitmap jobs require a bw1 raster")
+    if mode not in (0, 1, 2):
+        raise ValueError("Uncompressed TSPL bitmap mode must be 0, 1, or 2")
+    packed = pack_bw1_rows(raster, lsb_first=False, reverse_traversal=reverse_traversal)
+    if invert_bits:
+        packed = bytes(value ^ 0xFF for value in packed)
+    return (
+        command_head(
+            "BITMAP",
+            f"0,0,{packed_row_width_bytes(raster.width)},{raster.height},{mode},",
+        )
+        + packed
+        + line_end
+    )
+
+
+def zlib_bitmap_command(
+    raster: RasterBuffer, *, line_end: bytes, window_bits: int = 15, level: int = 6,
+    x: int = 0, y: int = 0,
+) -> bytes:
+    """Build mode 3 with black-one rows and length-prefixed compressed data.
+
+    ``window_bits`` selects the wrapper (15: zlib, -15: raw DEFLATE).
+    Coordinates are native printer dots, including when sending row stripes.
+    """
+    if min(x, y) < 0:
+        raise ValueError("TSPL bitmap coordinates must be non-negative")
+    compressed = compress_zlib(pack_bw1_rows(raster), window_bits=window_bits, level=level)
+    return (
+        command_head(
+            "BITMAP",
+            f"{x},{y},{packed_row_width_bytes(raster.width)},{raster.height},3,{len(compressed)},",
+        )
+        + compressed
+        + line_end
+    )

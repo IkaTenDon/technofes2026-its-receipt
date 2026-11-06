@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import unittest
+
+from tests.helpers import build_capture_reporter, install_crc8_stub
+
+install_crc8_stub()
+
+from timiniprint.app import cli
+from timiniprint import reporting
+
+
+class AppCliCoreTests(unittest.TestCase):
+    def test_resolve_helpers(self) -> None:
+        args = argparse.Namespace(
+            force_text_mode=True,
+            force_image_mode=False,
+            darkness=4,
+            text="abc",
+            text_font="/tmp/f.ttf",
+            text_columns=12,
+            text_hard_wrap=False,
+            pdf_pages="1,2",
+            page_gap=3,
+            trim_side_margins=True,
+            trim_top_bottom_margins=False,
+            paper="tag",
+            feed=False,
+            retract=True,
+        )
+        self.assertTrue(cli._resolve_text_mode(args))
+        self.assertEqual(cli._resolve_blackening(args), 4)
+        self.assertEqual(cli._resolve_text_input(args), "abc")
+        self.assertEqual(cli._resolve_text_font(args), "/tmp/f.ttf")
+        self.assertEqual(cli._resolve_text_columns(args), 12)
+        self.assertTrue(cli._resolve_text_wrap(args))
+        self.assertEqual(cli._resolve_pdf_pages(args), "1,2")
+        self.assertEqual(cli._resolve_page_gap(args), 3)
+        self.assertTrue(cli._resolve_trim_side_margins(args))
+        self.assertFalse(cli._resolve_trim_top_bottom_margins(args))
+        self.assertEqual(cli._resolve_paper_preset_key(args), "tag")
+        self.assertEqual(cli._resolve_paper_motion_action(args), "retract")
+
+    def test_text_columns_validation(self) -> None:
+        args = argparse.Namespace(text_columns=0)
+        with self.assertRaises(ValueError):
+            cli._resolve_text_columns(args)
+
+    def test_trace_is_only_enabled_with_repeated_verbose(self) -> None:
+        for flags, threshold in (
+            ([], reporting.ReportLevel.WARNING),
+            (["-v"], reporting.ReportLevel.DEBUG),
+            (["-vv"], reporting.ReportLevel.TRACE),
+            (["-v", "--verbose"], reporting.ReportLevel.TRACE),
+            (["-vvv"], reporting.ReportLevel.TRACE),
+        ):
+            with self.subTest(flags=flags):
+                output = io.StringIO()
+                with contextlib.redirect_stderr(output):
+                    args = cli.parse_args(flags)
+                    reporter = cli._build_cli_reporter(args.verbose)
+                    reporter.status(short="ui progress")
+                    reporter.debug(detail="job summary")
+                    reporter.trace(detail="private raster")
+                    reporter.warning(short="warning")
+                    reporter.error(short="error")
+                self.assertEqual(reporter.min_level, threshold)
+                self.assertEqual("private raster" in output.getvalue(), threshold == reporting.ReportLevel.TRACE)
+                self.assertEqual("job summary" in output.getvalue(), bool(flags))
+                self.assertNotIn("ui progress", output.getvalue())
+                self.assertIn("Warning: warning", output.getvalue())
+                self.assertIn("Error: error", output.getvalue())
+
+    def test_emit_startup_debug_includes_version_and_platform(self) -> None:
+        reporter, sink = build_capture_reporter()
+
+        cli.emit_startup_debug(reporter)
+
+        detail = sink.messages[-1].detail
+        self.assertIn("timiniprint_version=", detail)
+        self.assertIn("platform=", detail)
+        self.assertIn("machine=", detail)
+        self.assertIn("python=", detail)
+        self.assertIn("frozen=", detail)
+
+
+if __name__ == "__main__":
+    unittest.main()

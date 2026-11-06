@@ -1,0 +1,9 @@
+__pycache__
+internal/
+metals*
+settings.json
+build/
+dist/
+release/
+AGENTS.local.md
+timiniprint/data/THIRD_PARTY_LICENSES.txt

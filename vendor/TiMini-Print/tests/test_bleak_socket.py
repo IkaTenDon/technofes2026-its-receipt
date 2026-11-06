@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import asyncio
+import types
+import unittest
+from unittest.mock import patch
+
+from timiniprint.devices import get_ble_transport_profile
+from timiniprint.printing.runtime.v5c import V5CRuntimeController
+from timiniprint.printing.runtime.v5x import V5XRuntimeController
+from timiniprint.transport.bluetooth.adapters.bleak_adapter import _BleakSocket
+from timiniprint.protocol.family import ProtocolFamily
+from timiniprint.protocol.families.v5x import (
+    V5X_FINALIZE_PACKET,
+    V5X_GET_SERIAL_PACKET,
+    V5X_NOTIFY_TRIGGER_STATUS_POLL,
+    V5X_STATUS_POLL_PACKET,
+)
+
+
+class _Char:
+    def __init__(self, uuid: str, properties):
+        self.uuid = uuid
+        self.properties = properties
+
+
+class _Svc:
+    def __init__(self, uuid: str, chars):
+        self.uuid = uuid
+        self.characteristics = chars
+
+
+class _Client:
+    def __init__(self, services, *, mtu_size=None):
+        self.services = services
+        self.mtu_size = mtu_size
+        self.calls = []
+        self.connected = False
+        self.disconnected = False
+        self.notify_callbacks = {}
+        self.stop_notify_calls = []
+
+    async def connect(self):
+        self.connected = True
+
+    async def write_gatt_char(self, char, chunk, response=True):
+        self.calls.append((char.uuid, bytes(chunk), response))
+
+    async def start_notify(self, char_uuid, callback):
+        self.notify_callbacks[char_uuid] = callback
+
+    async def stop_notify(self, char_uuid):
+        self.stop_notify_calls.append(char_uuid)
+        self.notify_callbacks.pop(char_uuid, None)
+
+    async def disconnect(self):
+        self.disconnected = True
+
+    def emit_notify(self, char_uuid: str, payload: bytes) -> None:
+        callback = self.notify_callbacks[char_uuid]
+        callback(char_uuid, bytearray(payload))
+
+
+class BleakSocketTests(unittest.TestCase):
+    def test_find_write_characteristic_preferred(self) -> None:
+        s = _BleakSocket()
+        services = [
+            _Svc(
+                "0000ae30-0000-1000-8000-00805f9b34fb",
+                [_Char("0000ae01-0000-1000-8000-00805f9b34fb", ["write-without-response"])],
+            )
+        ]
+        s._client = _Client(services)
+        s._connected = True
+        sel = asyncio.run(s._find_write_characteristic())
+        self.assertIsNotNone(sel)
+        self.assertEqual(sel.strategy, "preferred_uuid")
+
+    def test_send_async_chunks_and_response_mode(self) -> None:
+        s = _BleakSocket()
+        c = _Char("0000ae01-0000-1000-8000-00805f9b34fb", ["write-without-response"])
+        client = _Client([])
+        bindings = s._transport.bindings
+        s._client = client
+        s._connected = True
+        bindings.write_char = c
+        bindings.write_selection_strategy = "preferred_uuid"
+        bindings.write_response_preference = False
+        bindings.write_char_uuid = c.uuid
+        asyncio.run(s._send_async(b"X" * 45))
+        self.assertEqual(len(client.calls), 3)
+        self.assertTrue(all(len(call[1]) <= 20 for call in client.calls))
+        self.assertTrue(all(call[2] is False for call in client.calls))
+
+    def test_default_mtu_payload_starts_conservative(self) -> None:
+        s = _BleakSocket()
+
+        self.assertEqual(s._mtu_size, 20)
+
+    def test_connect_passes_socket_timeout_to_bleak_client(self) -> None:
+        client = _Client(
+            [
+                _Svc(
+                    "0000ae30-0000-1000-8000-00805f9b34fb",
+                    [_Char("0000ae01-0000-1000-8000-00805f9b34fb", ["write-without-response"])],
+                )
+            ]
+        )
+        target = object()
+        calls = []
+
+        def fake_client(address_or_device, **kwargs):
+            calls.append((address_or_device, kwargs))
+            return client
+
+        s = _BleakSocket(device_cache={"AA": target})
+        s.settimeout(12.0)
+        fake_bleak = types.SimpleNamespace(BleakClient=fake_client)
+
+        with patch("timiniprint.transport.bluetooth.adapters.bleak_adapter.IS_MACOS", False), patch.dict(
+            "sys.modules",
+            {"bleak": fake_bleak},
+        ):
+            asyncio.run(s._connect_async("AA"))
+
+        self.assertEqual(calls, [(target, {"timeout": 12.0})])
+        self.assertTrue(client.connected)
+
+    def test_connect_caps_reported_ble_mtu_to_standard_request(self) -> None:
+        client = _Client(
+            [
+                _Svc(
+                    "0000ae30-0000-1000-8000-00805f9b34fb",
+                    [_Char("0000ae01-0000-1000-8000-00805f9b34fb", ["write-without-response"])],
+                )
+            ],
+            mtu_size=247,
+        )
+        s = _BleakSocket(device_cache={"AA": object()}, ble_mtu_request=23)
+        fake_bleak = types.SimpleNamespace(BleakClient=lambda _target, **_kwargs: client)
+
+        with patch.dict("sys.modules", {"bleak": fake_bleak}):
+            asyncio.run(s._connect_async("AA"))
+
+        self.assertEqual(s._mtu_size, 20)
+
+    def test_connect_uses_reported_ble_mtu_when_profile_requests_it(self) -> None:
+        client = _Client(
+            [
+                _Svc(
+                    "0000ae30-0000-1000-8000-00805f9b34fb",
+                    [_Char("0000ae01-0000-1000-8000-00805f9b34fb", ["write-without-response"])],
+                )
+            ],
+            mtu_size=247,
+        )
+        s = _BleakSocket(device_cache={"AA": object()}, ble_mtu_request=512)
+        fake_bleak = types.SimpleNamespace(BleakClient=lambda _target, **_kwargs: client)
+
+        with patch.dict("sys.modules", {"bleak": fake_bleak}):
+            asyncio.run(s._connect_async("AA"))
+
+        self.assertEqual(s._mtu_size, 244)
+
+    def test_send_async_does_not_interpret_v5x_payload(self) -> None:
+        s = _BleakSocket(ble_profile=get_ble_transport_profile(ProtocolFamily.V5X))
+        cmd = _Char("0000ae01-0000-1000-8000-00805f9b34fb", ["write-without-response"])
+        bulk = _Char("0000ae03-0000-1000-8000-00805f9b34fb", ["write-without-response"])
+        client = _Client([])
+        bindings = s._transport.bindings
+        s._client = client
+        s._connected = True
+        bindings.write_char = cmd
+        bindings.bulk_write_char = bulk
+        bindings.write_selection_strategy = "preferred_uuid"
+        bindings.write_response_preference = False
+        bindings.write_char_uuid = cmd.uuid
+        bindings.bulk_write_char_uuid = bulk.uuid
+        data = (
+            V5X_GET_SERIAL_PACKET
+            + bytes.fromhex("2221A20001005D94FF")
+            + bytes.fromhex("2221A9000600010030010000EBFF")
+            + (b"\xAA\x55" * 16)
+            + V5X_FINALIZE_PACKET
+        )
+
+        asyncio.run(s._send_async(data))
+
+        self.assertTrue(all(call[0] == cmd.uuid for call in client.calls))
+        self.assertEqual(b"".join(call[1] for call in client.calls), data)
+
+    def test_v5x_notify_updates_flow_state(self) -> None:
+        s = _BleakSocket(ble_profile=get_ble_transport_profile(ProtocolFamily.V5X))
+        s._transport._runtime_controller = V5XRuntimeController()
+        self.assertTrue(s._flow_can_write)
+        s._handle_notification("", bytearray(bytes.fromhex("AA01")))
+        self.assertFalse(s._flow_can_write)
+        s._handle_notification("", bytearray(bytes.fromhex("AA00")))
+        self.assertTrue(s._flow_can_write)
+
+    def test_v5x_b2_notification_schedules_status_poll(self) -> None:
+        s = _BleakSocket(ble_profile=get_ble_transport_profile(ProtocolFamily.V5X))
+        cmd = _Char("0000ae01-0000-1000-8000-00805f9b34fb", ["write-without-response"])
+        client = _Client([])
+        bindings = s._transport.bindings
+        s._client = client
+        s._connected = True
+        bindings.write_char = cmd
+        bindings.write_selection_strategy = "preferred_uuid"
+        bindings.write_response_preference = False
+        bindings.write_char_uuid = cmd.uuid
+        s._transport._client = client
+        s._transport._runtime_controller = V5XRuntimeController()
+
+        async def run() -> None:
+            s._handle_notification("", bytearray(V5X_NOTIFY_TRIGGER_STATUS_POLL))
+            await asyncio.sleep(0.75)
+
+        asyncio.run(run())
+        self.assertEqual(client.calls, [(cmd.uuid, V5X_STATUS_POLL_PACKET, False)])
+
+    def test_v5c_notify_updates_flow_state(self) -> None:
+        s = _BleakSocket(ble_profile=get_ble_transport_profile(ProtocolFamily.V5C))
+        s._transport._runtime_controller = V5CRuntimeController()
+        self.assertTrue(s._flow_can_write)
+        s._handle_notification("", bytearray(bytes.fromhex("5688A70101000107FF")))
+        self.assertFalse(s._flow_can_write)
+        s._handle_notification("", bytearray(bytes.fromhex("5688A70101000000FF")))
+        self.assertTrue(s._flow_can_write)
+
+    def test_resolve_client_target_uses_cached_ble_device(self) -> None:
+        cached = object()
+        s = _BleakSocket(device_cache={"AA:BB:CC:DD:EE:FF": cached})
+        with patch("timiniprint.transport.bluetooth.adapters.bleak_adapter.IS_MACOS", False):
+            target = asyncio.run(s._resolve_client_target("aa:bb:cc:dd:ee:ff"))
+        self.assertIs(target, cached)
+
+    def test_resolve_client_target_bypasses_cache_for_uuid_addresses(self) -> None:
+        cached = object()
+        address = "2123321321-2CE0-8122-7AC5-29988EF86A08"
+        s = _BleakSocket(device_cache={address.upper(): cached})
+        with patch("timiniprint.transport.bluetooth.adapters.bleak_adapter.IS_MACOS", True):
+            target = asyncio.run(s._resolve_client_target(address.lower()))
+        self.assertEqual(target, address.lower())
+
+    def test_close_cleanup_disconnect(self) -> None:
+        s = _BleakSocket()
+        loop = asyncio.new_event_loop()
+        s._loop = loop
+        client = _Client([])
+        s._client = client
+        s._connected = True
+        s._transport.bindings.notify_char_uuid = "0000ae02-0000-1000-8000-00805f9b34fb"
+        loop.run_until_complete(s._transport.start_notify_if_available(client, s._handle_notification))
+        self.assertTrue(client.notify_callbacks)
+        s.close()
+        self.assertFalse(s._connected)
+        self.assertIsNone(s._client)
+        self.assertIsNone(s._loop)
+        self.assertEqual(client.stop_notify_calls, ["0000ae02-0000-1000-8000-00805f9b34fb"])
+        self.assertFalse(client.notify_callbacks)
+
+
+if __name__ == "__main__":
+    unittest.main()

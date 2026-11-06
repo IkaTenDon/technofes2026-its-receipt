@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import re
+import unittest
+
+from timiniprint.devices import PrinterCatalog
+from timiniprint.devices.profiles import (
+    ModelDetection,
+    PrinterModel,
+)
+from tools.render_readme_models import (
+    render_supported_models_block,
+    validate_catalog_models,
+)
+
+
+def _readme_name_candidates(name: str) -> tuple[str, ...]:
+    return (
+        name,
+        f"{name}-ABCD",
+        f"{name}_ABCD",
+        f"{name}ABCD",
+    )
+
+
+def _detect_supported_readme_name(catalog: PrinterCatalog, name: str):
+    for candidate in _readme_name_candidates(name):
+        detected = catalog.detect_device(candidate)
+        if detected is not None:
+            return detected
+    return None
+
+
+def _supported_readme_name_matches_model(
+    catalog: PrinterCatalog,
+    name: str,
+    model_key: str,
+) -> bool:
+    detected = _detect_supported_readme_name(catalog, name)
+    if detected is not None and detected.model_key == model_key:
+        return True
+    return model_key in {
+        model.model_key
+        for model in catalog.get_models_by_public_name(name)
+    }
+
+
+class ReadmeModelInventoryTests(unittest.TestCase):
+    def test_catalog_models_validate_for_readme_rendering(self) -> None:
+        self.assertEqual(validate_catalog_models(), [])
+
+    def test_readme_names_match_catalog_detection_contract(self) -> None:
+        catalog = PrinterCatalog.load()
+
+        for model in catalog.models:
+            for name in model.names:
+                with self.subTest(model=model.model_key, status="supported", name=name):
+                    self.assertTrue(
+                        _supported_readme_name_matches_model(catalog, name, model.model_key)
+                    )
+
+    def test_supported_block_renders_non_empty_content(self) -> None:
+        supported = render_supported_models_block()
+
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])APA46Y(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])PPA2L(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])PPA2LH(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])DP_A4(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])DL_X7Pro(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])P4(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])P1(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])P11(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])P2(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])M02(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])M02S(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])M110(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])M120(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])T02(?![A-Z0-9_-])")
+        self.assertNotRegex(supported, r"(?<![A-Z0-9_-])Q02E(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])D11(?![A-Z0-9_-])")
+        self.assertRegex(supported, r"(?<![A-Z0-9_-])D11S(?![A-Z0-9_-])")
+
+        self.assertIsNone(re.search(r"(?<![A-Z0-9_-])P100(?![A-Z0-9_-])", supported))
+        self.assertIsNone(re.search(r"(?<![A-Z0-9_-])P100S(?![A-Z0-9_-])", supported))
+
+    def test_marketing_name_renders_as_primary_clone_group_name(self) -> None:
+        model = PrinterModel(
+            model_key="demo",
+            profile_key="demo",
+            origin_ids=("vendor.manual",),
+            marketing_names=("Friendly Cat Printer",),
+            detections=(
+                ModelDetection(exact_names=("BT-01", "BT-02")),
+            ),
+        )
+
+        self.assertEqual(
+            render_supported_models_block([model]),
+            "- Friendly Cat Printer and clones: BT-01, BT-02",
+        )
+
+    def test_single_detection_marketing_name_renders_as_clone_alias(self) -> None:
+        model = PrinterModel(
+            model_key="demo",
+            profile_key="demo",
+            origin_ids=("vendor.manual",),
+            marketing_names=("Friendly Cat Printer",),
+            detections=(
+                ModelDetection(exact_names=("BT-01",)),
+            ),
+        )
+
+        self.assertEqual(
+            render_supported_models_block([model]),
+            "- Friendly Cat Printer and clones: BT-01",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

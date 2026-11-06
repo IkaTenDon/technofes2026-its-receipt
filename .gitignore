@@ -1,0 +1,8 @@
+.venv/
+.setup-tmp/
+__pycache__/
+*.py[cod]
+data/
+preview*.png
+width-test*.png
+config.local.toml

@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import unittest
+
+from timiniprint.devices import get_ble_transport_profile
+from timiniprint.protocol.families import get_protocol_behavior
+from timiniprint.protocol.family import ProtocolFamily
+
+
+class BleTransportProfileTests(unittest.TestCase):
+    def test_protocol_behavior_does_not_own_transport_configuration(self) -> None:
+        for family in ProtocolFamily:
+            with self.subTest(family=family.value):
+                self.assertFalse(hasattr(get_protocol_behavior(family), "transport"))
+
+    def test_family_transport_profiles_keep_endpoint_and_pacing_values(self) -> None:
+        expected = {
+            ProtocolFamily.TINY: (512, 50, "", ""),
+            ProtocolFamily.TINY_PREFIXED: (512, 50, "", ""),
+            ProtocolFamily.V5G: (56 * 8, 30, "", ""),
+            ProtocolFamily.V5C: (20, 50, "", ""),
+            ProtocolFamily.V5X: (
+                20,
+                50,
+                "0000ae30-0000-1000-8000-00805f9b34fb",
+                "",
+            ),
+            ProtocolFamily.PHOMEMO_ESC: (
+                128,
+                20,
+                "0000ff00-0000-1000-8000-00805f9b34fb",
+                "0000ff02-0000-1000-8000-00805f9b34fb",
+            ),
+            ProtocolFamily.NIIMBOT: (
+                20,
+                10,
+                "e7810a71-73ae-499d-8c15-faa9aef0c3f2",
+                "",
+            ),
+            ProtocolFamily.TOPRINT_HPRT_ESC: (180, 10, "", ""),
+            ProtocolFamily.ELEPH_TSPL: (
+                20,
+                30,
+                "000018f0-0000-1000-8000-00805f9b34fb",
+                "00002af1-0000-1000-8000-00805f9b34fb",
+            ),
+            ProtocolFamily.TOPRINT_TSPL: (180, 10, "", ""),
+            ProtocolFamily.INSTAPRINT_CORE: (180, 10, "", ""),
+            ProtocolFamily.FUNNY_LX: (
+                100,
+                0,
+                "0000ffe6-0000-1000-8000-00805f9b34fb",
+                "0000ffe1-0000-1000-8000-00805f9b34fb",
+            ),
+        }
+
+        for family, values in expected.items():
+            with self.subTest(family=family.value):
+                profile = get_ble_transport_profile(family)
+                self.assertEqual(
+                    (
+                        profile.standard_chunk_cap,
+                        profile.standard_write_delay_ms,
+                        profile.preferred_service_uuid,
+                        profile.preferred_write_char_uuid,
+                    ),
+                    values,
+                )
+
+    def test_v5x_bulk_and_flow_settings_are_transport_mechanics_only(self) -> None:
+        v5x = get_ble_transport_profile(ProtocolFamily.V5X)
+        self.assertIsNotNone(v5x.bulk_write)
+        assert v5x.bulk_write is not None
+        self.assertEqual(v5x.bulk_write.char_uuid, "0000ae03-0000-1000-8000-00805f9b34fb")
+        self.assertEqual(v5x.bulk_write.chunk_cap, 180)
+        self.assertEqual(v5x.bulk_write.write_delay_ms, 30)
+        self.assertTrue(v5x.bulk_write.flow_controlled)
+        self.assertEqual(v5x.flow_resume_timeout_s, 600.0)
+        self.assertFalse(v5x.flow_controlled_standard_write)
+        self.assertEqual(v5x.write_without_response_payload_reserve, 5)
+
+        v5c = get_ble_transport_profile(ProtocolFamily.V5C)
+        self.assertTrue(v5c.flow_controlled_standard_write)
+
+    def test_tiny_profiles_enable_passive_buffer_flow_control(self) -> None:
+        for family in (ProtocolFamily.TINY, ProtocolFamily.TINY_PREFIXED):
+            with self.subTest(family=family.value):
+                profile = get_ble_transport_profile(family)
+                self.assertTrue(profile.prefer_generic_notify)
+                self.assertTrue(profile.flow_controlled_standard_write)
+                self.assertEqual(profile.flow_resume_timeout_s, 600.0)
+
+    def test_unspecialized_families_keep_generic_transport_defaults(self) -> None:
+        for family in (
+            ProtocolFamily.LUCK_NORMAL,
+            ProtocolFamily.LUCK_NORMAL_A4,
+            ProtocolFamily.DCK,
+        ):
+            with self.subTest(family=family.value):
+                profile = get_ble_transport_profile(family)
+                self.assertEqual(profile.standard_chunk_cap, 20)
+                self.assertEqual(profile.standard_write_delay_ms, 50)
+
+        self.assertEqual(get_ble_transport_profile(None).standard_chunk_cap, 512)
+
+
+if __name__ == "__main__":
+    unittest.main()
