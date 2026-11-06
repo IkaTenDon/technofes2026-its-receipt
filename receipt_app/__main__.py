@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from .camera import capture_photo
+from .camera import LiveCamera
 from .config import load_config
 from .controller import Controller
 from .instance import InstanceLock
@@ -74,10 +74,14 @@ def main(argv=None) -> int:
         with InstanceLock(database.with_suffix(".lock")):
             store = Storage(database)
             printer = DryRunPrinter() if cfg.test_mode else TiMiniPrinter(cfg)
-            controller = Controller(cfg, store, capture_photo, render_receipt, printer)
+            camera = LiveCamera(cfg.camera)
+            controller = Controller(cfg, store, lambda _: camera.snapshot(), render_receipt, printer)
             root = tk.Tk()
-            ReceiptWindow(root, cfg, controller)
-            root.mainloop()
+            try:
+                ReceiptWindow(root, cfg, controller, camera)
+                root.mainloop()
+            finally:
+                camera.stop()
         return 0
     except Exception as exc:
         print(f"エラー: {exc}", file=sys.stderr)

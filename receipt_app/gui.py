@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import sys
+import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -33,8 +35,14 @@ STATE_LABELS = {
 
 
 class ReceiptWindow:
-    def __init__(self, root: tk.Tk, cfg, controller):
+    def __init__(self, root: tk.Tk, cfg, controller, camera):
         self.root, self.cfg, self.controller = root, cfg, controller
+        self.camera = camera
+        self._closing = False
+        self._close_started_at = None
+        self._after_id = None
+        self.camera_ref = None
+        self.camera_token = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="receipt")
         self.future = None
         self.gate = KeyGate()
@@ -77,16 +85,24 @@ class ReceiptWindow:
         preview = ttk.Frame(root, padding=10)
         preview.grid(row=0, column=1, sticky="nsew")
         preview.columnconfigure(0, weight=1)
-        preview.rowconfigure(1, weight=1)
+        preview.rowconfigure(4, weight=1)
+        ttk.Label(preview, text="カメラ（アプリ起動中は常時表示）").grid(row=0, sticky="w")
+        self.camera_canvas = tk.Canvas(preview, background="#222222", highlightthickness=0,
+                                       width=400, height=225)
+        self.camera_canvas.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.camera_status_var = tk.StringVar(value="カメラを準備しています。")
+        ttk.Label(preview, textvariable=self.camera_status_var, wraplength=400,
+                  justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 12))
         self.preview_var = tk.StringVar(value="レシートプレビュー（画面内のみ）")
-        ttk.Label(preview, textvariable=self.preview_var).grid(sticky="w")
+        ttk.Label(preview, textvariable=self.preview_var).grid(row=3, sticky="w")
         self.canvas = tk.Canvas(preview, background="#dddddd", highlightthickness=0, width=400)
-        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.canvas.grid(row=4, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(preview, orient="vertical", command=self.canvas.yview)
-        scroll.grid(row=1, column=1, sticky="ns")
+        scroll.grid(row=4, column=1, sticky="ns")
         self.canvas.configure(yscrollcommand=scroll.set)
         for key in (cfg.photo_key, cfg.no_photo_key):
             root.bind_all(f"<KeyPress-{key}>", self.key_press)
+        self.camera.start()
         self._poll()
 
     def _button(self, parent, text, command):
@@ -101,14 +117,15 @@ class ReceiptWindow:
         return "break"
 
     def _start(self, operation):
-        if self.future is not None or self.controller.snapshot().busy:
+        if self._closing or self.future is not None or self.controller.snapshot().busy:
             return
         self._clear_preview()
         self.future = self.executor.submit(operation)
 
     def accept(self, with_photo):
         if self.controller.snapshot().state not in {"error", "interrupted"}:
-            self._start(lambda: self.controller.accept(with_photo))
+            controller = self.controller
+            self._start(lambda: controller.accept(with_photo))
 
     def retry(self):
         if not self.controller.snapshot().can_retry:
@@ -147,12 +164,12 @@ class ReceiptWindow:
             image.close()
 
     def sample(self, with_photo):
-        if self.future is not None:
+        if self._closing or self.future is not None:
             return
         photo = Image.linear_gradient("L").convert("RGB") if with_photo else None
         try:
             image = render_receipt(self.cfg.receipt, 1, datetime.now().astimezone().isoformat(timespec="seconds"), photo)
-            self._show_image(image, "人工写真の見本（採番・撮影・送信なし）" if with_photo else "写真なしの見本（採番・送信なし）")
+            self._show_image(image, "人工写真の見本（採番・送信なし）" if with_photo else "写真なしの見本（採番・送信なし）")
             self.is_sample = True
         except Exception as exc:
             messagebox.showerror("見本を描画できません", str(exc), parent=self.root)
@@ -160,7 +177,37 @@ class ReceiptWindow:
             if photo:
                 photo.close()
 
+    def _update_camera_preview(self):
+        image, message, sequence = self.camera.preview()
+        self.camera_status_var.set(message)
+        token = sequence, message
+        try:
+            if token == self.camera_token:
+                return
+            self.camera_canvas.delete("all")
+            self.camera_ref = None
+            if image is not None:
+                image.thumbnail((400, 225), Image.Resampling.LANCZOS)
+                self.camera_ref = ImageTk.PhotoImage(image)
+                self.camera_canvas.create_image(200, 112, image=self.camera_ref, anchor="center")
+            self.camera_token = token
+        finally:
+            if image is not None:
+                image.close()
+
     def _poll(self):
+        self._after_id = None
+        self._update_camera_preview()
+        if self._closing:
+            if self.camera.stop(timeout=0):
+                self._finish_close()
+            elif time.monotonic() - self._close_started_at >= 2.0:
+                print("警告: カメラドライバーの解放を確認できないため、停止要求を維持して終了します。", file=sys.stderr)
+                self._finish_close()
+            else:
+                self.message_var.set("カメラの終了を待っています。ドライバーが停止した場合は自動解放できないことがあります。")
+                self._after_id = self.root.after(50, self._poll)
+            return
         for key in (self.cfg.photo_key, self.cfg.no_photo_key):
             if not (self.get_key_state(0x70 + int(key[1:]) - 1) & 0x8000):
                 self.gate.release(key)
@@ -192,13 +239,31 @@ class ReceiptWindow:
         elif (busy or not view.has_image) and self.preview_ref is not None and not self.is_sample:
             self._clear_preview()
         self.last_view = view
-        self.root.after(50, self._poll)
+        self._after_id = self.root.after(50, self._poll)
+
+    def _cancel_poll(self):
+        if self._after_id is not None:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
 
     def close(self):
+        if self._closing:
+            return
         if self.future is not None or self.controller.snapshot().busy:
             messagebox.showinfo("処理中です", "処理終了後に閉じてください。強制終了後は送信結果が不明になる場合があります。", parent=self.root)
             return
+        self._closing = True
+        self._close_started_at = time.monotonic()
+        for button in self.buttons:
+            button.configure(state="disabled")
+        if self.camera.stop(timeout=0):
+            self._finish_close()
+
+    def _finish_close(self):
+        self._cancel_poll()
         self.controller.discard()
         self._clear_preview()
+        self.camera_canvas.delete("all")
+        self.camera_ref = None
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
