@@ -47,7 +47,7 @@ class LiveCamera:
             previous = self._frame
             self._frame = image
             self._captured_at = self.clock()
-            self._message = "カメラ映像を表示中です。写真ありの受付ではこの映像を使用します。"
+            self._message = "写真ありの受付ではこの映像を使用します。"
             self._sequence += 1
             if previous is not None:
                 previous.close()
