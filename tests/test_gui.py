@@ -135,7 +135,7 @@ class GuiTests(unittest.TestCase):
         self.settle()
         self.assertEqual(self.controller.snapshot().state, "completed")
         self.controller.capture.assert_called_once()
-        self.assertTrue(self.storage.latest().with_photo)
+        self.assertTrue(self.controller.snapshot().with_photo)
 
     def test_camera_preview_continues_after_receipt_error(self):
         self.window.accept(True)
@@ -189,7 +189,7 @@ class GuiTests(unittest.TestCase):
         gate.release("F1")
         self.assertTrue(gate.press("F1"))
 
-    def test_closing_window_does_not_discard_a_failed_receipt(self):
+    def test_closing_window_releases_image_and_keeps_only_number_and_time(self):
         from receipt_app.printer import PrintFailure
         self.controller.printer = Mock()
         self.controller.printer.print_image.side_effect = PrintFailure("transfer interrupted", uncertain=True)
@@ -197,8 +197,8 @@ class GuiTests(unittest.TestCase):
         self.settle()
         with patch.object(self.root, "destroy"):
             self.window.close()
-        self.assertEqual(self.storage.get(1).status, "error")
-        self.assertTrue(self.storage.get(1).outcome_uncertain)
+        self.assertEqual(self.storage.get(1).number, 1)
+        self.assertEqual(set(vars(self.storage.get(1))), {"number", "created_at"})
         self.assertFalse(self.controller.snapshot().has_image)
 
 

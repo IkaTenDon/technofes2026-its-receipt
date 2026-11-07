@@ -30,7 +30,7 @@ class KeyGate:
 STATE_LABELS = {
     "waiting": "キー入力待機中", "capturing": "撮影中", "rendering": "画像作成中",
     "printing": "印刷処理中", "completed": "印刷処理完了", "error": "エラー",
-    "expired": "画像破棄済み", "interrupted": "前回の処理が未解決",
+    "expired": "画像破棄済み",
 }
 
 
@@ -123,7 +123,7 @@ class ReceiptWindow:
         self.future = self.executor.submit(operation)
 
     def accept(self, with_photo):
-        if self.controller.snapshot().state not in {"error", "interrupted"}:
+        if self.controller.snapshot().state != "error":
             controller = self.controller
             self._start(lambda: controller.accept(with_photo))
 
@@ -225,7 +225,7 @@ class ReceiptWindow:
         busy = view.busy or self.future is not None
         for button in self.buttons:
             button.configure(state="disabled" if busy else "normal")
-        if view.state in {"error", "interrupted"}:
+        if view.state == "error":
             self.photo_button.configure(state="disabled")
             self.no_photo_button.configure(state="disabled")
         self.retry_button.configure(state="normal" if view.can_retry and not busy else "disabled")

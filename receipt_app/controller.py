@@ -35,20 +35,13 @@ class Controller:
         self._live_preparation_retry = False
         self._outcome_uncertain = False
         self._ticket: Ticket | None = None
+        self._with_photo: bool | None = None
         self._state, self._message = "waiting", ""
-        store.recover_interrupted()
-        latest = store.latest()
-        if latest and latest.status in {"error", "interrupted"}:
-            self._ticket = latest
-            self._outcome_uncertain = latest.outcome_uncertain
-            self._state = "interrupted"
-            self._message = (f"前回の受付 {latest.number} は未解決です。{latest.error}\n"
-                             "再起動により画像を失ったため再印刷できません。確認して受付を閉じてください。")
 
     def snapshot(self) -> ViewState:
         with self._lock:
             return ViewState(self._state, self._ticket.number if self._ticket else None,
-                             self._ticket.with_photo if self._ticket else None,
+                             self._with_photo,
                              self._message, self._busy,
                              not self._busy and (self._image is not None or self._live_preparation_retry),
                              self._image is not None)
@@ -72,14 +65,17 @@ class Controller:
 
     def accept(self, with_photo: bool) -> bool:
         with self._lock:
-            if self._state in {"error", "interrupted"} or not self._begin():
+            if self._state == "error" or not self._begin():
                 return False
             self._clear_image()
             self._ticket = None
+            self._with_photo = None
             self._outcome_uncertain = False
             self._live_preparation_retry = True
         try:
-            self._ticket = self.store.allocate(with_photo, self.now())
+            ticket = self.store.allocate(self.now())
+            with self._lock:
+                self._ticket, self._with_photo = ticket, with_photo
             self._process()
         except Exception as exc:
             self._record_error(f"受付を保存できませんでした: {exc}")
@@ -106,12 +102,10 @@ class Controller:
         photo = None
         try:
             if self._image is None:
-                if ticket.with_photo:
+                if self._with_photo:
                     self._set("capturing", "撮影中です。撮影に失敗した場合は同番号で撮り直せます。")
-                    self.store.update(ticket.number, "capturing")
                     photo = self.capture(self.cfg.camera)
                 self._set("rendering", "レシート画像を作成しています。")
-                self.store.update(ticket.number, "rendering")
                 image = self.render(self.cfg.receipt, ticket.number, ticket.created_at, photo)
                 with self._lock:
                     self._image = image
@@ -120,11 +114,8 @@ class Controller:
                 photo.close()
                 photo = None
             self._set("printing", "テスト処理中です。" if self.cfg.test_mode else "プリンターへ送信中です。")
-            self.store.update(ticket.number, "printing", increment_attempt=True)
             send_started = True
             result = self.printer.print_image(self._image)
-            status = "test_completed" if result.test_mode else "completed"
-            self.store.update(ticket.number, status, outcome_uncertain=self._outcome_uncertain)
             message = result.detail
             if self._outcome_uncertain:
                 message += "\n以前の印刷結果は不明です。同じ番号の紙が重複している可能性があります。"
@@ -144,13 +135,7 @@ class Controller:
                 photo.close()
 
     def _record_error(self, message: str):
-        if self._ticket:
-            try:
-                self.store.update(self._ticket.number, "error", message,
-                                  outcome_uncertain=self._outcome_uncertain)
-            except Exception as exc:
-                message += f"\n状態をSQLiteへ保存できませんでした: {exc}"
-        else:
+        if self._ticket is None:
             self._live_preparation_retry = False
         self._set("error", message)
 
@@ -177,15 +162,10 @@ class Controller:
         with self._lock:
             if self._busy:
                 return False
-            if self._ticket and self._state in {"error", "interrupted"}:
-                try:
-                    self.store.update(self._ticket.number, "discarded")
-                except Exception as exc:
-                    self._message = f"受付を閉じる状態を保存できませんでした: {exc}"
-                    return False
             self._clear_image()
             self._live_preparation_retry = False
             self._ticket = None
+            self._with_photo = None
             self._outcome_uncertain = False
             self._state, self._message = "waiting", ""
             return True

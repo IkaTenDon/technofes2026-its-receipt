@@ -56,7 +56,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args[1:3], (1, "2026-11-07T12:34:56+09:00"))
         self.assertIsNone(args[3])
         self.assertEqual(self.controller.snapshot().state, "completed")
-        self.assertEqual(self.store.get(1).status, "test_completed")
+        self.assertFalse(self.controller.snapshot().with_photo)
 
     def test_failure_retries_same_number_datetime_and_image_without_recapture(self):
         self.printer.print_image.side_effect = [UncertainFailure("wire disconnected"),
@@ -75,8 +75,8 @@ class ControllerTests(unittest.TestCase):
         self.render.assert_called_once()
         self.assertEqual(self.store.latest().number, 1)
         self.assertEqual(self.store.get(1).created_at, first_ticket.created_at)
-        self.assertEqual(self.store.get(1).attempts, 2)
-        self.assertEqual(self.store.get(1).status, "completed")
+        self.assertEqual(self.printer.print_image.call_count, 2)
+        self.assertEqual(self.controller.snapshot().state, "completed")
 
     def test_capture_failure_can_recapture_on_same_number(self):
         self.capture.side_effect = [RuntimeError("camera unavailable"), Image.new("RGB", (20, 20))]
@@ -90,7 +90,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.controller.retry())
         self.assertEqual(self.capture.call_count, 2)
         self.assertEqual(self.store.latest().number, 1)
-        self.assertEqual(self.store.get(1).attempts, 1)
+        self.printer.print_image.assert_called_once()
 
     def test_busy_input_is_discarded_instead_of_queued(self):
         started, finish = threading.Event(), threading.Event()
@@ -144,7 +144,7 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(self.controller.retry())
         self.assertFalse(self.controller.accept(False))
         self.assertTrue(self.controller.discard())
-        self.assertEqual(self.store.get(1).status, "discarded")
+        self.assertEqual(self.controller.snapshot().state, "waiting")
         self.printer.print_image.side_effect = None
         self.assertTrue(self.controller.accept(False))
         self.assertEqual(self.store.latest().number, 2)
@@ -170,49 +170,37 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(self.controller.snapshot().can_retry)
         self.assertFalse(self.controller.retry())
 
-    def test_database_failure_before_send_prevents_printer_call(self):
-        original_update = self.store.update
+    def test_no_database_access_is_needed_after_allocation(self):
+        original_allocate = self.store.allocate
+        with patch.object(self.store, "_connect", wraps=self.store._connect) as connect:
+            def allocate(created_at):
+                ticket = original_allocate(created_at)
+                connect.side_effect = sqlite3.OperationalError("disk unavailable")
+                return ticket
 
-        def update(number, status, *args, **kwargs):
-            if status == "printing":
-                raise sqlite3.OperationalError("disk full")
-            return original_update(number, status, *args, **kwargs)
+            with patch.object(self.store, "allocate", side_effect=allocate):
+                self.controller.accept(False)
+                self.clock.advance()
+                self.controller.retry()
+            connect.assert_called_once()
+        self.assertEqual(self.printer.print_image.call_count, 2)
+        self.assertEqual(self.controller.snapshot().state, "completed")
 
-        with patch.object(self.store, "update", side_effect=update):
-            self.controller.accept(False)
-        self.printer.print_image.assert_not_called()
-        self.assertEqual(self.store.get(1).attempts, 0)
+    def test_restart_waits_for_input_without_restoring_previous_state(self):
+        self.printer.print_image.side_effect = UncertainFailure("wire disconnected")
+        self.controller.accept(True)
         self.assertEqual(self.controller.snapshot().state, "error")
-        self.assertNotIn("重複", self.controller.snapshot().message)
-
-    def test_database_failure_after_send_reports_uncertain_result(self):
-        original_update = self.store.update
-
-        def update(number, status, *args, **kwargs):
-            if status == "test_completed":
-                raise sqlite3.OperationalError("disk full")
-            return original_update(number, status, *args, **kwargs)
-
-        with patch.object(self.store, "update", side_effect=update):
-            self.controller.accept(False)
-        self.printer.print_image.assert_called_once()
-        self.assertEqual(self.controller.snapshot().state, "error")
-        self.assertIn("重複", self.controller.snapshot().message)
-        self.assertEqual(self.store.get(1).status, "error")
-
-    def test_restarted_unresolved_ticket_has_no_image_and_no_retry(self):
-        ticket = self.store.allocate(True, "original timestamp")
-        self.store.update(ticket.number, "printing", increment_attempt=True)
+        self.controller.shutdown()
         restarted = self.make_controller()
         state = restarted.snapshot()
-        self.assertEqual((state.state, state.number, state.with_photo), ("interrupted", 1, True))
+        self.assertEqual((state.state, state.number, state.with_photo), ("waiting", None, None))
+        self.assertEqual(state.message, "")
         self.assertFalse(state.has_image)
         self.assertFalse(state.can_retry)
         self.assertFalse(restarted.retry())
-        self.assertFalse(restarted.accept(False))
-        self.assertEqual(self.store.get(1).status, "interrupted")
-        self.assertTrue(restarted.discard())
-        self.assertEqual(self.store.get(1).status, "discarded")
+        self.printer.print_image.side_effect = None
+        self.assertTrue(restarted.accept(False))
+        self.assertEqual(self.store.latest().number, 2)
 
     def test_failed_allocation_does_not_print_or_claim_retry_is_possible(self):
         with patch.object(self.store, "allocate", side_effect=sqlite3.OperationalError("readonly")):
@@ -253,12 +241,8 @@ class ControllerTests(unittest.TestCase):
         self.clock.advance()
         self.controller.retry()
         self.assertIn("重複", self.controller.snapshot().message)
-        saved = Storage(self.store.path).get(1)
-        self.assertTrue(saved.outcome_uncertain)
-        self.assertIn("重複", saved.error)
-        restarted = self.make_controller()
-        self.assertEqual(restarted.snapshot().state, "interrupted")
-        self.assertIn("重複", restarted.snapshot().message)
+        self.assertEqual(self.store.latest().number, 1)
+        self.assertEqual(self.printer.print_image.call_count, 2)
 
     def test_successful_retry_keeps_earlier_uncertainty_visible(self):
         self.printer.print_image.side_effect = [UncertainFailure("transfer interrupted"),
@@ -268,19 +252,16 @@ class ControllerTests(unittest.TestCase):
         self.controller.retry()
         self.assertEqual(self.controller.snapshot().state, "completed")
         self.assertIn("重複", self.controller.snapshot().message)
-        self.assertTrue(self.store.get(1).outcome_uncertain)
 
-    def test_shutdown_releases_image_and_preserves_unresolved_receipt(self):
+    def test_shutdown_releases_image_without_changing_saved_number_and_time(self):
         self.printer.print_image.side_effect = UncertainFailure("transfer interrupted")
         self.controller.accept(False)
         self.assertTrue(self.controller.shutdown())
         self.assertFalse(self.controller.snapshot().has_image)
         self.assertFalse(self.controller.snapshot().can_retry)
-        self.assertEqual(self.store.get(1).status, "error")
-        self.assertTrue(self.store.get(1).outcome_uncertain)
+        self.assertEqual(self.store.get(1).number, 1)
         restarted = self.make_controller()
-        self.assertEqual((restarted.snapshot().state, restarted.snapshot().number), ("interrupted", 1))
-        self.assertFalse(restarted.accept(False))
+        self.assertEqual((restarted.snapshot().state, restarted.snapshot().number), ("waiting", None))
 
 
 if __name__ == "__main__":
