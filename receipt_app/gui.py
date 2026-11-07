@@ -28,7 +28,7 @@ class KeyGate:
 
 
 STATE_LABELS = {
-    "waiting": "待機中", "capturing": "撮影中", "rendering": "画像作成中",
+    "waiting": "キー入力待機中", "capturing": "撮影中", "rendering": "画像作成中",
     "printing": "印刷処理中", "completed": "印刷処理完了", "error": "エラー",
     "expired": "画像破棄済み", "interrupted": "前回の処理が未解決",
 }
@@ -86,14 +86,14 @@ class ReceiptWindow:
         preview.grid(row=0, column=1, sticky="nsew")
         preview.columnconfigure(0, weight=1)
         preview.rowconfigure(4, weight=1)
-        ttk.Label(preview, text="カメラ（アプリ起動中は常時表示）").grid(row=0, sticky="w")
+        ttk.Label(preview, text="カメラプレビュー").grid(row=0, sticky="w")
         self.camera_canvas = tk.Canvas(preview, background="#222222", highlightthickness=0,
                                        width=400, height=225)
         self.camera_canvas.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self.camera_status_var = tk.StringVar(value="カメラを準備しています。")
         ttk.Label(preview, textvariable=self.camera_status_var, wraplength=400,
                   justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 12))
-        self.preview_var = tk.StringVar(value="レシートプレビュー（画面内のみ）")
+        self.preview_var = tk.StringVar(value="レシートプレビュー")
         ttk.Label(preview, textvariable=self.preview_var).grid(row=3, sticky="w")
         self.canvas = tk.Canvas(preview, background="#dddddd", highlightthickness=0, width=400)
         self.canvas.grid(row=4, column=0, sticky="nsew")
@@ -148,7 +148,7 @@ class ReceiptWindow:
         self.preview_token = None
         self.is_sample = False
 
-    def _show_image(self, image, label):
+    def _show_image(self, image):
         self._clear_preview()
         try:
             display = image.copy()
@@ -158,7 +158,6 @@ class ReceiptWindow:
             self.canvas.create_image(8, 8, image=self.preview_ref, anchor="nw")
             self.canvas.configure(scrollregion=(0, 0, display.width + 16, display.height + 16))
             self.canvas.yview_moveto(0)
-            self.preview_var.set(label)
             display.close()
         finally:
             image.close()
@@ -168,8 +167,8 @@ class ReceiptWindow:
             return
         photo = Image.linear_gradient("L").convert("RGB") if with_photo else None
         try:
-            image = render_receipt(self.cfg.receipt, 1, datetime.now().astimezone().isoformat(timespec="seconds"), photo)
-            self._show_image(image, "人工写真の見本（採番・送信なし）" if with_photo else "写真なしの見本（採番・送信なし）")
+            image = render_receipt(self.cfg.receipt, 1, datetime.now().astimezone().isoformat(timespec="milliseconds"), photo)
+            self._show_image(image)
             self.is_sample = True
         except Exception as exc:
             messagebox.showerror("見本を描画できません", str(exc), parent=self.root)
@@ -234,7 +233,7 @@ class ReceiptWindow:
         if view.has_image and not busy and not self.is_sample and self.preview_token != token:
             image = self.controller.preview_image()
             if image is not None:
-                self._show_image(image, f"受付 {view.number} のレシート（画面内のみ）")
+                self._show_image(image)
                 self.preview_token = token
         elif (busy or not view.has_image) and self.preview_ref is not None and not self.is_sample:
             self._clear_preview()

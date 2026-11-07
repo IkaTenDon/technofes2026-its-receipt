@@ -26,7 +26,7 @@ class Controller:
         self.cfg, self.store = cfg, store
         self.capture, self.render, self.printer = capture, render, printer
         self.clock = clock
-        self.now = now or (lambda: datetime.now().astimezone().isoformat(timespec="seconds"))
+        self.now = now or (lambda: datetime.now().astimezone().isoformat(timespec="milliseconds"))
         self._lock = threading.RLock()
         self._image = None
         self._deadline = None
@@ -35,7 +35,7 @@ class Controller:
         self._live_preparation_retry = False
         self._outcome_uncertain = False
         self._ticket: Ticket | None = None
-        self._state, self._message = "waiting", "ボタン入力を待っています。"
+        self._state, self._message = "waiting", ""
         store.recover_interrupted()
         latest = store.latest()
         if latest and latest.status in {"error", "interrupted"}:
@@ -187,7 +187,7 @@ class Controller:
             self._live_preparation_retry = False
             self._ticket = None
             self._outcome_uncertain = False
-            self._state, self._message = "waiting", "ボタン入力を待っています。"
+            self._state, self._message = "waiting", ""
             return True
 
     def shutdown(self) -> bool:

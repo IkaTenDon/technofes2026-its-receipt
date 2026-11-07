@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 
 import qrcode
@@ -12,6 +13,12 @@ from .config import ReceiptConfig
 
 MAX_RECEIPT_HEIGHT = 30000
 MAX_RECEIPT_PIXELS = 32_000_000
+
+
+def format_receipt_datetime(created_at: str) -> str:
+    value = datetime.fromisoformat(created_at)
+    weekday = "月火水木金土日"[value.weekday()]
+    return f"{value:%Y/%m/%d} ({weekday}) {value:%H:%M:%S}.{value.microsecond // 1000:03d}"
 
 
 def _font(cfg: ReceiptConfig, size: int) -> ImageFont.FreeTypeFont:
@@ -140,7 +147,7 @@ def render_receipt(cfg: ReceiptConfig, number: int, created_at: str,
     if cfg.title:
         blocks.append(_text_block(cfg, cfg.title, cfg.title_size, centered=True))
     blocks.append(_text_block(cfg, f"来場番号 {number:06d}", cfg.number_size, centered=True))
-    blocks.append(_text_block(cfg, f"日時 {created_at}", cfg.body_size, centered=True))
+    blocks.append(_text_block(cfg, f"日時 {format_receipt_datetime(created_at)}", cfg.body_size, centered=True))
     if cfg.body:
         blocks.append(_text_block(cfg, cfg.body, cfg.body_size))
     if photo is not None:

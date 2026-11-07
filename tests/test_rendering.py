@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image, ImageFont
 
 from receipt_app.config import ReceiptConfig
-from receipt_app.rendering import (MAX_RECEIPT_HEIGHT, make_qr, make_width_pattern,
+from receipt_app.rendering import (MAX_RECEIPT_HEIGHT, format_receipt_datetime, make_qr, make_width_pattern,
                                    prepare_photo, render_receipt, wrap_text)
 
 
@@ -20,8 +20,8 @@ class RenderingTests(unittest.TestCase):
         self.cfg = ReceiptConfig()
 
     def test_optional_photo_changes_height_only_by_photo_and_gap(self):
-        without = render_receipt(self.cfg, 1, "2026-11-07 12:34:56 +09:00")
-        with_photo = render_receipt(self.cfg, 1, "2026-11-07 12:34:56 +09:00",
+        without = render_receipt(self.cfg, 1, "2026-11-07T12:34:56.123+09:00")
+        with_photo = render_receipt(self.cfg, 1, "2026-11-07T12:34:56.123+09:00",
                                     Image.new("RGB", (640, 480), "gray"))
         self.assertEqual(without.mode, "1")
         self.assertEqual(without.width, self.cfg.width_px)
@@ -37,6 +37,12 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("", lines)
         self.assertTrue(all(font.getlength(line) <= 180 for line in lines))
         self.assertEqual("".join(lines), text.replace("\n", ""))
+
+    def test_receipt_datetime_shows_japanese_weekday_and_milliseconds(self):
+        self.assertEqual(format_receipt_datetime("2026-11-07T12:34:56.123456+09:00"),
+                         "2026/11/07 (土) 12:34:56.123")
+        self.assertEqual(format_receipt_datetime("2026-11-09T00:00:00+09:00"),
+                         "2026/11/09 (月) 00:00:00.000")
 
     def test_long_body_increases_receipt_height(self):
         short = render_receipt(self.cfg, 1, "2026-11-07 12:00")
@@ -72,7 +78,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_bad_font_is_explicit_error(self):
         with self.assertRaisesRegex(ValueError, "フォントが見つかりません"):
-            render_receipt(replace(self.cfg, font_path="missing-font.ttf"), 1, "now")
+            render_receipt(replace(self.cfg, font_path="missing-font.ttf"), 1, "2026-11-07T12:00:00")
 
     def test_invalid_number_fails(self):
         with self.assertRaises(ValueError):
@@ -80,7 +86,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_excessive_length_fails_before_final_canvas(self):
         with self.assertRaisesRegex(ValueError, "長すぎます"):
-            render_receipt(replace(self.cfg, body="あ\n" * MAX_RECEIPT_HEIGHT), 1, "now")
+            render_receipt(replace(self.cfg, body="あ\n" * MAX_RECEIPT_HEIGHT), 1, "2026-11-07T12:00:00")
 
     def test_width_pattern_has_black_pixels_at_both_edges(self):
         pattern = make_width_pattern(self.cfg)

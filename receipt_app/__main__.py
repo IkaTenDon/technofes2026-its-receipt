@@ -38,7 +38,7 @@ def main(argv=None) -> int:
         if command == "preview":
             photo = Image.linear_gradient("L").convert("RGB") if args.photo_sample else None
             try:
-                image = render_receipt(cfg.receipt, 1, datetime.now().astimezone().isoformat(timespec="seconds"), photo)
+                image = render_receipt(cfg.receipt, 1, datetime.now().astimezone().isoformat(timespec="milliseconds"), photo)
             finally:
                 if photo:
                     photo.close()
@@ -74,7 +74,7 @@ def main(argv=None) -> int:
         from .gui import ReceiptWindow
 
         # Catch invalid font / QR layout before allocating any visitor number.
-        check = render_receipt(cfg.receipt, 1, datetime.now().astimezone().isoformat(timespec="seconds"))
+        check = render_receipt(cfg.receipt, 1, datetime.now().astimezone().isoformat(timespec="milliseconds"))
         check.close()
         database = cfg.resolve(cfg.database_path)
         with InstanceLock(database.with_suffix(".lock")):
