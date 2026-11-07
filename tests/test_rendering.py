@@ -1,11 +1,13 @@
 from dataclasses import replace
 from pathlib import Path
 import unittest
+from unittest.mock import Mock, call, patch
 
 import cv2
 import numpy as np
 from PIL import Image, ImageFont
 
+from receipt_app import rendering
 from receipt_app.config import ReceiptConfig
 from receipt_app.rendering import (MAX_RECEIPT_HEIGHT, format_receipt_datetime, make_qr, make_width_pattern,
                                    prepare_photo, render_receipt, wrap_text)
@@ -44,9 +46,31 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(format_receipt_datetime("2026-11-09T00:00:00+09:00"),
                          "2026/11/09 (月) 00:00:00.000")
 
-    def test_long_body_increases_receipt_height(self):
+    def test_custom_sections_render_in_order_with_number_and_time_filled_in(self):
+        cfg = replace(self.cfg, head="ようこそ", number="受付 {number} 番", time="受付時刻\n{time}",
+                      menu="展示A\n展示B", qr="公式SNS")
+        order = Mock()
+        with Image.new("RGB", (640, 480), "gray") as photo, \
+                patch.object(rendering, "_text_block", wraps=rendering._text_block) as text, \
+                patch.object(rendering, "prepare_photo", wraps=prepare_photo) as picture, \
+                patch.object(rendering, "make_qr", wraps=make_qr) as qr:
+            order.attach_mock(text, "text")
+            order.attach_mock(picture, "photo")
+            order.attach_mock(qr, "qr")
+            render_receipt(cfg, 42, "2026-11-07T12:34:56.123+09:00", photo).close()
+        self.assertEqual(order.mock_calls, [
+            call.text(cfg, "ようこそ", cfg.head_size, centered=True),
+            call.text(cfg, "受付 0042 番", cfg.number_size, centered=True),
+            call.text(cfg, "受付時刻\n2026/11/07 (土) 12:34:56.123", cfg.body_size, centered=True),
+            call.photo(cfg, photo),
+            call.text(cfg, "展示A\n展示B", cfg.body_size),
+            call.text(cfg, "公式SNS", cfg.body_size, centered=True),
+            call.qr(cfg),
+        ])
+
+    def test_long_menu_increases_receipt_height(self):
         short = render_receipt(self.cfg, 1, "2026-11-07 12:00")
-        long = render_receipt(replace(self.cfg, body="ご来場ありがとうございます。" * 100),
+        long = render_receipt(replace(self.cfg, menu="ご来場ありがとうございます。" * 100),
                               1, "2026-11-07 12:00")
         self.assertGreater(long.height, short.height)
 
@@ -86,7 +110,7 @@ class RenderingTests(unittest.TestCase):
 
     def test_excessive_length_fails_before_final_canvas(self):
         with self.assertRaisesRegex(ValueError, "長すぎます"):
-            render_receipt(replace(self.cfg, body="あ\n" * MAX_RECEIPT_HEIGHT), 1, "2026-11-07T12:00:00")
+            render_receipt(replace(self.cfg, menu="あ\n" * MAX_RECEIPT_HEIGHT), 1, "2026-11-07T12:00:00")
 
     def test_width_pattern_has_black_pixels_at_both_edges(self):
         pattern = make_width_pattern(self.cfg)

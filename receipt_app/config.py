@@ -11,15 +11,17 @@ class ReceiptConfig:
     width_px: int = 384
     margin_px: int = 16
     gap_px: int = 12
-    title: str = "ご来場ありがとうございます"
-    body: str = "【変更してください】イベントのご案内をここに記載します。"
-    footer: str = "【仮の内容】QRコードのリンク先は未設定です。"
+    head: str = "ご来場ありがとうございます"
+    number: str = "あなたは{number}人目の来場者です"
+    time: str = "日時 {time}"
+    menu: str = "【変更してください】展示のご案内\n展示内容をここに記入してください。"
+    qr: str = "公式SNSのご案内"
     qr_data: str = "https://example.com/"
     font_path: str = "C:/Windows/Fonts/meiryo.ttc"
     font_index: int = 0
-    title_size: int = 26
+    head_size: int = 26
     body_size: int = 20
-    number_size: int = 30
+    number_size: int = 22
     line_spacing_px: int = 5
     qr_max_px: int = 280
     qr_min_module_px: int = 4
@@ -81,10 +83,16 @@ def load_config(path: str | Path) -> AppConfig:
     unknown = data.keys() - {"app", "receipt", "camera", "printer"}
     if unknown:
         raise ValueError(f"不明な設定セクション: {', '.join(unknown)}")
+    receipt = data.get("receipt", {})
+    if isinstance(receipt, dict):
+        for old, new in (("title", "head"), ("body", "menu"), ("footer", "qr"),
+                         ("title_size", "head_size")):
+            if old in receipt:
+                receipt.setdefault(new, receipt.pop(old))
     try:
         cfg = AppConfig(
             base_dir=path.parent,
-            receipt=_section(ReceiptConfig, data.get("receipt", {})),
+            receipt=_section(ReceiptConfig, receipt),
             camera=_section(CameraConfig, data.get("camera", {})),
             printer=_section(PrinterConfig, data.get("printer", {})),
             **data.get("app", {}),
@@ -101,7 +109,7 @@ def validate_config(cfg: AppConfig) -> None:
         "width_px": (r.width_px, 128, 2048),
         "margin_px": (r.margin_px, 0, 512),
         "gap_px": (r.gap_px, 0, 512),
-        "title_size": (r.title_size, 8, 200),
+        "head_size": (r.head_size, 8, 200),
         "body_size": (r.body_size, 8, 200),
         "number_size": (r.number_size, 8, 200),
         "line_spacing_px": (r.line_spacing_px, 0, 100),
@@ -139,11 +147,14 @@ def validate_config(cfg: AppConfig) -> None:
         for key in (cfg.photo_key, cfg.no_photo_key)
     ):
         raise ValueError("受付キーには異なる F1〜F12 を指定してください")
-    for value in (r.title, r.body, r.footer, r.qr_data, r.font_path,
+    for value in (r.head, r.number, r.time, r.menu, r.qr, r.qr_data, r.font_path,
                   p.source_dir, p.bluetooth_target, p.model_key, p.paper_preset, cfg.database_path):
         if not isinstance(value, str):
             raise ValueError("文言・パス・接続先は文字列で指定してください")
     if not r.qr_data or len(r.qr_data) > 2000:
         raise ValueError("qr_data は1〜2000文字にしてください")
-    if sum(map(len, (r.title, r.body, r.footer))) > 10000:
+    if sum(map(len, (r.head, r.number, r.time, r.menu, r.qr))) > 10000:
         raise ValueError("レシート文面は合計10000文字以内にしてください")
+    for name, template, placeholder in (("number", r.number, "{number}"), ("time", r.time, "{time}")):
+        if template.count(placeholder) != 1:
+            raise ValueError(f"receipt.{name} には {placeholder} を1回だけ入れてください")

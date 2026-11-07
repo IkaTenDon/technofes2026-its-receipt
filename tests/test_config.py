@@ -24,16 +24,36 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg.test_mode)
         self.assertEqual((cfg.photo_key, cfg.no_photo_key), ("F1", "F2"))
         self.assertEqual(cfg.receipt.width_px, 384)
-        self.assertIn("変更してください", cfg.receipt.body)
+        self.assertIn("変更してください", cfg.receipt.menu)
         self.assertEqual(cfg.receipt.qr_data, "https://example.com/")
         self.assertEqual(cfg.printer.bluetooth_target, "")
 
     def test_partial_config_uses_defaults_and_keeps_japanese_text(self):
-        cfg = self.load('[receipt]\nbody = "日本語のご案内"\n')
-        self.assertEqual(cfg.receipt.body, "日本語のご案内")
+        cfg = self.load('[receipt]\nmenu = """\n日本語のご案内\n展示の説明"""\n')
+        self.assertEqual(cfg.receipt.menu, "日本語のご案内\n展示の説明")
         self.assertEqual(cfg.base_dir, self.base.resolve())
         self.assertTrue(cfg.test_mode)
         self.assertEqual(cfg.resolve(cfg.database_path), self.base / "data" / "receipts.sqlite3")
+
+    def test_old_receipt_keys_are_loaded_and_explicit_new_values_win(self):
+        cfg = self.load(
+            '[receipt]\ntitle = "旧見出し"\nhead = "新見出し"\nbody = "展示の説明"\n'
+            'footer = "SNSへの案内"\ntitle_size = 28\n'
+        )
+        self.assertEqual(cfg.receipt.head, "新見出し")
+        self.assertEqual(cfg.receipt.menu, "展示の説明")
+        self.assertEqual(cfg.receipt.qr, "SNSへの案内")
+        self.assertEqual(cfg.receipt.head_size, 28)
+        self.assertEqual(self.load('[receipt]\ntitle = "旧見出し"\n').receipt.head, "旧見出し")
+
+    def test_number_and_time_templates_require_their_placeholder_once(self):
+        cfg = self.load('[receipt]\nnumber = "受付 {number} 番"\ntime = "{time} 発行"\n')
+        self.assertEqual(cfg.receipt.number, "受付 {number} 番")
+        self.assertEqual(cfg.receipt.time, "{time} 発行")
+        for key in ("number", "time"):
+            for value in ("固定文", f"{{{key}}} {{{key}}}"):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, f"receipt.{key}"):
+                    self.load(f'[receipt]\n{key} = "{value}"\n')
 
     def test_unknown_names_are_rejected_instead_of_ignored(self):
         for text in ('[other]\nvalue=1\n', '[receipt]\nwidht_px=384\n',
@@ -90,7 +110,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_long_text_is_rejected_before_allocating_render_canvas(self):
         with self.assertRaisesRegex(ValueError, "10000文字"):
-            self.load('[receipt]\nbody="' + "あ" * 10001 + '"\n')
+            self.load('[receipt]\nmenu="' + "あ" * 10001 + '"\n')
 
     def test_malformed_toml_is_not_silently_defaulted(self):
         with self.assertRaises(tomllib.TOMLDecodeError):

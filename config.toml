@@ -11,16 +11,21 @@ image_retention_seconds = 120  # 処理終了後の再印刷用画像のRAM保�
 width_px = 384  # 暫定。57 mmから確定した値ではない。実機・機種設定と照合
 margin_px = 16
 gap_px = 12
-title = "ご来場ありがとうございます"
-# 未確定: 下記body / footer / qr_dataをイベントの実際の内容に変更
-body = "【変更してください】イベントのご案内をここに記載します。"
-footer = "【仮の内容】QRコードのリンク先は未設定です。"
+head = "ご来場ありがとうございます"
+number = "あなたは{number}人目の来場者です"  # {number} に来場番号が入ります
+time = "日時 {time}"  # {time} に受付日時が入ります
+# 展示の案内は、三重引用符の内側に複数行で書けます。
+menu = """
+【変更してください】展示のご案内
+展示内容をここに記入してください。"""
+qr = "公式SNSのご案内"
+# 公式SNSのURLに変更してください。
 qr_data = "https://example.com/"
 font_path = "C:/Windows/Fonts/meiryo.ttc"  # フォントは同梱しない
 font_index = 0
-title_size = 26
+head_size = 26
 body_size = 20
-number_size = 30
+number_size = 22
 line_spacing_px = 5
 qr_max_px = 280
 qr_min_module_px = 4  # QRの1モジュールの最小ドット数。白余白は4モジュール

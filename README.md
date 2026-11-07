@@ -41,7 +41,7 @@ if (-not (Test-Path -LiteralPath .\config.local.toml)) {
 notepad .\config.local.toml
 ```
 
-メモ帳では、`[receipt]` の `title`、`body`、`footer` を実際の文面に、`qr_data` を本番の QR コードの内容に変更します。`[printer]` の `bluetooth_target` には、探索で確認した対象プリンターの名前またはアドレスを記入します。同名の機器がある場合はアドレスで区別します。`model_key` は通常は空のままにし、自動判別できない場合だけ、実機に適合する TiMini の機種キーを指定します。紙幅だけから機種を推測して指定しないでください。
+メモ帳では、`[receipt]` の `head`、`number`、`time`、`menu`、`qr` を実際の文面に、`qr_data` を公式 SNS の URL に変更します。`[printer]` の `bluetooth_target` には、探索で確認した対象プリンターの名前またはアドレスを記入します。同名の機器がある場合はアドレスで区別します。`model_key` は通常は空のままにし、自動判別できない場合だけ、実機に適合する TiMini の機種キーを指定します。紙幅だけから機種を推測して指定しないでください。
 
 紙へ印刷するには、`[app]` の `test_mode = true` を `test_mode = false` に変更して保存します。`true` はプリンターへの送信だけを止める設定で、採番と常時カメラプレビューは実行し、写真ありの場合はレシートへの写真合成も行います。来場番号を保存する `database_path` は、イベント中と番号を継続する次回の運用で同じものを使います。試し刷りを含む受付操作にも番号は発行されるため、番号と実際の来場人数は一致しません。設定変更はアプリの再起動後に反映されます。
 
@@ -111,9 +111,25 @@ uv run --offline --no-sync --no-python-downloads python -m receipt_app preview -
 uv run --offline --no-sync --no-python-downloads python -m receipt_app width-pattern --output width-test.png
 ```
 
-レシートには受付操作時の番号と PC の現在日時を `yyyy/mm/dd (曜日) hh:mm:ss.SSS` 形式で印字します。時刻の UTC オフセットは SQLite に保存しますが、紙面には表示しません。番号、日時、定型文、QR、余白は写真の有無で共通です。写真領域だけを追加または省略するため、写真なしは短くなります。文章はフォントの実測幅で折り返し、要素の高さを積み重ねて画像を作ります。写真は中心を切り抜いて設定サイズに合わせ、グレースケール、コントラスト・ガンマ補正、Floyd–Steinberg の二値化を適用します。文字と QR は写真のディザリングを通りません。QR は誤り訂正 M、4モジュールの白余白、整数ドットのモジュールで生成し、設定した最小ドット数で収まらない場合は縮小せずエラーにします。これは画像上の読取性への対策であり、紙面の読み取りを保証しません。
+レシートは上から `head`（お礼）、`number`（来場者番号）、`time`（受付日時）、`photo`（写真）、`menu`（展示案内）、`qr`（公式 SNS の案内と QR コード）の順に印字します。写真なしで受け付けた場合は写真の領域を省きます。受付日時は `yyyy/mm/dd (曜日) hh:mm:ss.SSS` 形式で印字し、SQLite には UTC オフセットを含めて保存します。文章はフォントの実測幅で折り返し、要素の高さを積み重ねて画像を作ります。写真は中心を切り抜いて設定サイズに合わせ、グレースケール、コントラスト・ガンマ補正、Floyd–Steinberg の二値化を適用します。文字と QR は写真のディザリングを通りません。QR は誤り訂正 M、4モジュールの白余白、整数ドットのモジュールで生成し、設定した最小ドット数で収まらない場合は縮小せずエラーにします。これは画像上の読取性への対策であり、紙面の読み取りを保証しません。
 
-本番用の設定は `config.toml` を `config.local.toml` へコピーして編集すると区別できます。文面は `[receipt]` の `title`、`body`、`footer`、`qr_data` を変更します。複数行の文面には TOML の三重引用符を使えます。余白、文字サイズ、写真の高さも同じセクションです。相対パスは設定ファイルのあるフォルダーを基準に解決し、変更後はアプリを再起動します。番号を継続する場合は `[app].database_path` を同じ DB に向けてください。テスト受付も本番と同じ採番を行うため、イベント前の試運転には `data/test.sqlite3` のような別 DB を使うと区別できます。
+本番用の設定は `config.toml` を `config.local.toml` へコピーし、`[receipt]` の文面を編集します。展示案内には TOML の三重引用符で複数行を書けます。`qr_data` の `https://example.com/` は仮の URL です。公式 SNS の URL に置き換えてください。
+
+```toml
+[receipt]
+head = "ご来場ありがとうございます"
+number = "あなたは{number}人目の来場者です"
+time = "日時 {time}"
+menu = """
+展示のご案内
+展示内容をここに記入してください。"""
+qr = "公式SNSのご案内"
+qr_data = "https://example.com/"
+```
+
+`number` には `{number}` を、`time` には `{time}` をそれぞれ1回入れます。`{number}` は `0001` のように最低4桁にそろえた受付番号に、`{time}` は受付日時に置き換わります。写真の高さや濃淡は `photo_height_px`、`photo_contrast`、`photo_gamma` で調整できます。文字サイズは `head_size`、`number_size`、`body_size` で指定し、日時・展示案内・QR の案内文には `body_size` を使います。
+
+以前の設定にある `title`、`body`、`footer`、`title_size` は、対応する `head`、`menu`、`qr`、`head_size` が未設定のときに読み込みます。相対パスは設定ファイルのあるフォルダーを基準に解決し、変更後はアプリを再起動します。番号を継続する場合は `[app].database_path` を同じ DB に向けてください。テスト受付も本番と同じ採番を行うため、イベント前の試運転には `data/test.sqlite3` のような別 DB を使うと区別できます。
 
 プリンターを接続する際は電源と Bluetooth を有効にし、スマートフォンの印刷アプリなど他の接続を閉じます。機種により Windows の Bluetooth 設定で初回ペアリング操作が必要です。ドライバーによる通常の Windows 印刷キューは使いません。TiMini の探索と機種一覧は次の公式 CLI で確認できます。自動更新確認は環境変数で無効にしています。
 

@@ -144,17 +144,19 @@ def render_receipt(cfg: ReceiptConfig, number: int, created_at: str,
     if type(number) is not int or number < 1:
         raise ValueError("来場番号には1以上の整数が必要です")
     blocks = []
-    if cfg.title:
-        blocks.append(_text_block(cfg, cfg.title, cfg.title_size, centered=True))
-    blocks.append(_text_block(cfg, f"来場番号 {number:06d}", cfg.number_size, centered=True))
-    blocks.append(_text_block(cfg, f"日時 {format_receipt_datetime(created_at)}", cfg.body_size, centered=True))
-    if cfg.body:
-        blocks.append(_text_block(cfg, cfg.body, cfg.body_size))
+    if cfg.head:
+        blocks.append(_text_block(cfg, cfg.head, cfg.head_size, centered=True))
+    number_text = cfg.number.replace("{number}", f"{number:04d}")
+    blocks.append(_text_block(cfg, number_text, cfg.number_size, centered=True))
+    time_text = cfg.time.replace("{time}", format_receipt_datetime(created_at))
+    blocks.append(_text_block(cfg, time_text, cfg.body_size, centered=True))
     if photo is not None:
         blocks.append(prepare_photo(cfg, photo))
+    if cfg.menu:
+        blocks.append(_text_block(cfg, cfg.menu, cfg.body_size))
+    if cfg.qr:
+        blocks.append(_text_block(cfg, cfg.qr, cfg.body_size, centered=True))
     blocks.append(make_qr(cfg))
-    if cfg.footer:
-        blocks.append(_text_block(cfg, cfg.footer, cfg.body_size))
     return _stack(cfg, blocks)
 
 
