@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 /data/
+/tests/
 preview*.png
 width-test*.png
 config.local.toml
