@@ -48,7 +48,14 @@ notepad .\config.local.toml
 開場前に、まず印字幅確認用パターンを印刷します。`receipt.width_px` の初期値384は暫定値であり、今回のプリンターの実印字幅と確定したものではありません。次のコマンドは、来場番号を発行せずに確認用画像を保存し、本番用設定に従って印刷します。受付アプリを閉じた状態で実行してください。
 
 ```powershell
-uv run --offline --no-sync --no-python-downloads python -m receipt_app --config config.local.toml width-pattern --output width-test.png --print
+$widthCheck = Join-Path ([IO.Path]::GetTempPath()) ("technofes-width-" + [guid]::NewGuid() + ".png")
+try {
+    uv run --offline --no-sync --no-python-downloads python -B -m receipt_app --config config.local.toml width-pattern --output $widthCheck --print
+    if ($LASTEXITCODE -ne 0) { throw '印字幅テストに失敗しました。' }
+}
+finally {
+    if (Test-Path -LiteralPath $widthCheck) { Remove-Item -LiteralPath $widthCheck }
+}
 ```
 
 紙の左右の端線が欠けていないこと、文字が読めること、QR コードを読み取ると設定した内容になることを確認します。印字幅テストのコマンドは、送信後も接続を保持して確認入力を待ちます。用紙が最後まで印刷されてから Enter を押すと接続を解放して終了します。幅不一致のエラーが出た場合は、表示された機種の幅と用紙設定を確認して設定を修正します。自動縮小はしません。白紙、欠け、圧縮、白黒反転、QR の読み取り失敗がある場合は、解決してから受付に進みます。実際に紙が出て読めることを、本番開始の条件にしてください。
@@ -81,18 +88,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1 -Con
 
 実行環境は `uv` で管理します。アプリと印刷用の依存関係は `pyproject.toml` にまとめ、具体的な導入版は `uv.lock` に固定しています。セットアップの `--locked` は、ロックファイルを変更せず、設定と一致する版を導入する指定です。Python は `.python-version` と `pyproject.toml` の指定に従って3.12系を使用します。依存関係の更新はイベント前に検証する作業として行い、受付当日の起動時には行いません。[uv のプロジェクト管理](https://docs.astral.sh/uv/guides/projects/)、[ロックと同期の説明](https://docs.astral.sh/uv/concepts/projects/sync/)
 
-PowerShell でプロジェクトフォルダーへ移動し、開発時も次のコマンドで準備してテストモードを起動できます。ExecutionPolicy の指定は、この PowerShell プロセスだけに適用されます。既存の Python を明示して環境を作る場合は、セットアップに `-PythonExe 'C:\実際の場所\python.exe'` を追加してください。指定する Python は3.12 x64で、Tcl/Tkを利用できる必要があります。
+PowerShell でプロジェクトフォルダーへ移動し、次のコマンドで準備してテストモードを起動できます。設定は後述の実機確認用に用意したファイルを指定します。ExecutionPolicy の指定は、この PowerShell プロセスだけに適用されます。既存の Python を明示して環境を作る場合は、セットアップに `-PythonExe 'C:\実際の場所\python.exe'` を追加してください。指定する Python は3.12 x64で、Tcl/Tkを利用できる必要があります。
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1 -TestMode
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1 -TestMode -Config '<検証用設定ファイルの絶対パス>'
 ```
 
 PowerShell の補助スクリプトを使わずに準備する場合は、同じフォルダーで `uv sync --locked` を実行します。セットアップスクリプトはこの同期に加えて Tkinter の動作確認を行います。準備済みの環境では、次のように Python の入口を直接起動することもできます。
 
 ```powershell
 uv sync --locked
-uv run --offline --no-sync --no-python-downloads python -m receipt_app --test run
+uv run --offline --no-sync --no-python-downloads python -B -m receipt_app --config '<検証用設定ファイルの絶対パス>' --test run
 ```
 
 `--offline --no-sync --no-python-downloads` は、起動時にネットワークから取得せず、依存関係を同期せず、Python の自動取得も行わない指定です。直接の `uv run` では依存環境の整合性確認は行わないため、導入後に `pyproject.toml` や `uv.lock` を変更した場合は先にセットアップをやり直してください。当日の起動スクリプトでは `uv sync --locked --offline --check --no-python-downloads` による確認を行い、不一致なら受付画面を起動せず停止します。
@@ -106,10 +113,19 @@ TiMini Print のソースは `vendor/TiMini-Print` に固定版を同梱して�
 画面の見本ボタンは、採番や送信をせずにレシートの見た目を確認するためのものです。人工写真の見本はライブ映像を合成しませんが、GUI のカメラプレビュー自体は動作し続けます。見本の来場番号は1で、SQLite の採番には影響しません。カメラを使わずに見本を確認する場合は、次の CLI コマンドで人工画像の PNG を作成できます。来場者の写真を保存するコマンドは用意していません。
 
 ```powershell
-uv run --offline --no-sync --no-python-downloads python -m receipt_app preview --output preview-no-photo.png
-uv run --offline --no-sync --no-python-downloads python -m receipt_app preview --photo-sample --output preview-with-synthetic-photo.png
-uv run --offline --no-sync --no-python-downloads python -m receipt_app width-pattern --output width-test.png
+$receiptCheck = Join-Path ([IO.Path]::GetTempPath()) ("technofes-preview-" + [guid]::NewGuid() + ".png")
+try {
+    uv run --offline --no-sync --no-python-downloads python -B -m receipt_app preview --photo-sample --output $receiptCheck
+    if ($LASTEXITCODE -ne 0) { throw '見本の生成に失敗しました。' }
+    Invoke-Item -LiteralPath $receiptCheck
+    Read-Host '画像を確認して閉じてから Enter を押してください'
+}
+finally {
+    if (Test-Path -LiteralPath $receiptCheck) { Remove-Item -LiteralPath $receiptCheck }
+}
 ```
+
+写真なしの見本は `--photo-sample` を外して生成します。画像はリポジトリ外の一時フォルダーに保存し、確認後に削除します。
 
 レシートは上から `head`（お礼）、`number`（来場者番号）、`time`（受付日時）、`photo`（写真）、`menu`（展示案内）、`qr`（公式 SNS の案内と QR コード）の順に印字します。写真なしで受け付けた場合は写真の領域を省きます。受付日時は `yyyy/mm/dd (曜日) hh:mm:ss.SSS` 形式で印字し、SQLite には UTC オフセットを含めて保存します。文章はフォントの実測幅で折り返し、要素の高さを積み重ねて画像を作ります。写真は中心を切り抜いて設定サイズに合わせ、グレースケール、コントラスト・ガンマ補正、Floyd–Steinberg の二値化を適用します。文字と QR は写真のディザリングを通りません。QR は誤り訂正 M、4モジュールの白余白、整数ドットのモジュールで生成し、設定した最小ドット数で収まらない場合は縮小せずエラーにします。これは画像上の読取性への対策であり、紙面の読み取りを保証しません。
 
@@ -129,7 +145,7 @@ qr_data = "https://example.com/"
 
 `number` には `{number}` を、`time` には `{time}` をそれぞれ1回入れます。`{number}` は `0001` のように最低4桁にそろえた受付番号に、`{time}` は受付日時に置き換わります。写真の高さや濃淡は `photo_height_px`、`photo_contrast`、`photo_gamma` で調整できます。文字サイズは `head_size`、`number_size`、`body_size` で指定し、日時・展示案内・QR の案内文には `body_size` を使います。
 
-以前の設定にある `title`、`body`、`footer`、`title_size` は、対応する `head`、`menu`、`qr`、`head_size` が未設定のときに読み込みます。相対パスは設定ファイルのあるフォルダーを基準に解決し、変更後はアプリを再起動します。番号を継続する場合は `[app].database_path` を同じ DB に向けてください。テスト受付も本番と同じ採番を行うため、イベント前の試運転には `data/test.sqlite3` のような別 DB を使うと区別できます。
+以前の設定にある `title`、`body`、`footer`、`title_size` は、対応する `head`、`menu`、`qr`、`head_size` が未設定のときに読み込みます。相対パスは設定ファイルのあるフォルダーを基準に解決し、変更後はアプリを再起動します。番号を継続する場合は `[app].database_path` を同じ DB に向けてください。テスト受付も本番と同じ採番を行うため、試運転ではリポジトリ外に専用の DB を用意します。
 
 プリンターを接続する際は電源と Bluetooth を有効にし、スマートフォンの印刷アプリなど他の接続を閉じます。機種により Windows の Bluetooth 設定で初回ペアリング操作が必要です。ドライバーによる通常の Windows 印刷キューは使いません。TiMini の探索と機種一覧は次の公式 CLI で確認できます。自動更新確認は環境変数で無効にしています。
 
@@ -141,11 +157,7 @@ uv run --offline --no-sync --no-python-downloads python .\vendor\TiMini-Print\ti
 
 `[printer].bluetooth_target` へ探索結果の名前またはアドレスを明示します。同名機がある会場ではアドレスを使って区別してください。`model_key` は自動判別できない場合だけ、実機に適合する既知のキーを指定します。モデルを推測して指定すると別プロトコルを送ることになるため、57 mmという紙幅だけから選ばないでください。`paper_preset` は空なら機種の既定で、必要ならその機種の可変長ロール紙設定へ変更します。固定長のラベル、回転・縦倍率を要する設定はこのアプリでは拒否します。
 
-印字幅は生成画像と、接続・機種準備後の TiMini `render_width_px` を照合します。違う場合は送信前に停止し、実際の設定幅をエラーで示します。上流に登録された幅と物理的に印字できる幅が一致することまでは保証しないため、実機で印字幅テストが必要です。本番用設定で `test_mode = false` にし、次のコマンドを使うと来場番号を発行せずテストパターンを送信できます。`--print` がない場合は PNG の作成だけです。`--test` または `test_mode = true` の場合は `--print` があっても送信しません。
-
-```powershell
-uv run --offline --no-sync --no-python-downloads python -m receipt_app --config config.local.toml width-pattern --output width-test.png --print
-```
+印字幅は生成画像と、接続・機種準備後の TiMini `render_width_px` を照合します。違う場合は送信前に停止し、実際の設定幅をエラーで示します。上流に登録された幅と物理的に印字できる幅が一致することまでは保証しないため、実機で印字幅テストが必要です。本番用設定で `test_mode = false` にし、Quick start の手順でテストパターンを送信します。`--print` を外すと PNG の作成だけを行います。`--test` または `test_mode = true` の場合は `--print` があっても送信しません。
 
 印字した紙で左右の端線、0から最終列までの目盛り、8ドット刻みが欠けずに見えることを確認します。設定が384なら右端は383です。端線が欠ける、全体が圧縮される、白黒が反転する場合は本番受付に進める状態ではありません。機種、用紙プリセット、余白を再確認してください。QR を実際の読み取り機器で読み、`qr_data` と一致することを確認します。濃度は文字・QR・写真を同時に見て `blackening` と写真の補正を調整します。`feed_padding` は機種固有単位で、mmではありません。
 
@@ -165,11 +177,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1 -Con
 
 画像保持期限後、またはアプリの再起動後は、写真入りレシートを復元できません。起動中に未解決の失敗が残っている場合は、保持期限後も番号と説明を表示し、新規受付を止めます。紙とプリンターを人が確認し、「画像を破棄して受付を閉じる」でその受付を終了できます。その操作後の新しい受付には新番号が発行されます。再起動すると処理状態も失われるため、前回の受付は復元せず、そのままキー入力待機へ進みます。画像を失ったまま同番号の写真を自動的に撮り直すことはありません。
 
-実機を使わない自動テストは、セットアップで依存関係一式を導入した後、次のコマンドで実行します。連番の永続化・並行採番、番号と日時だけを残す既存 DB の移行、撮影分岐とカメラ解放、画像寸法と QR デコード、起動中の失敗時の同番号再印刷、採番保存失敗時の印刷防止、保持期限、再起動後の待機、Windows GUI、長押し抑止、二重起動、上流 API による実ジョブ生成を検証します。GUI テストは非表示の Tk ウィンドウを作成し、ハードウェアには接続しません。
+アプリの自動テストは別のフォルダーで管理します。セットアップ後、外部テスト一式の `run_tests.py` にアプリのフォルダーを渡して実行します。テスト用の DB や設定ファイルは実行ごとにリポジトリ外の一時フォルダーへ作成し、終了時に削除します。件数と検証範囲は [検証記録](docs/VALIDATION.md) にまとめています。
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1
+& .\.venv\Scripts\python.exe -B '<外部テストフォルダー>\run_tests.py' .
 ```
+
+実機確認用の設定ファイルと DB も、リポジトリ外の専用一時フォルダーに置きます。コピーした設定では `[app].database_path` を `"test.sqlite3"` に変更すると、設定と同じフォルダーに検証用 DB ができます。`[printer].source_dir` など元のフォルダーを基準にしていたパスは絶対パスへ変更し、その設定ファイルを `scripts/start.ps1 -Config` で指定します。確認の終了後にアプリを閉じ、一時フォルダー内の設定・DB・ロックファイルを削除します。
 
 実機の受入確認では、まず別のテスト DB とテストモードで受付画面を開き、カメラ映像が表示されることを確認します。F2 で写真なしの短いレシートを表示し、その間もカメラ映像が更新されることを確認します。続いて F1 で、そのカメラ映像から取得した写真が合成され、写真分だけ長くなることを確認します。印刷中、受付エラー中、画像の保持期限後もライブ映像が止まらないこと、カメラを外すと古い映像が消えてエラーが表示され、写真なし受付を継続できることも確認します。実際の物理ボタンで長押しと連打を行い、処理中の押下が後から印刷されず、長押し一回が一件になることを確かめます。ウィンドウからフォーカスを外した状態の F1/F2 では受付されないことも確認します。
 
